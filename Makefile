@@ -33,6 +33,11 @@ LOG_DIR        ?= $(CURDIR)/logs
 PYTHON         ?= python3
 PIP            ?= pip
 
+# Make src/ importable as `verse_pipeline` for local (non-SLURM) targets
+# without needing `pip install -e .`.  Mirrors what slurm/_common.sh does
+# inside SLURM jobs.
+export PYTHONPATH := $(CURDIR)/src:$(PYTHONPATH)
+
 .DEFAULT_GOAL := help
 
 # =============================================================================
