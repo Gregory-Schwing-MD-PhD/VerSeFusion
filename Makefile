@@ -68,6 +68,19 @@ deep-clean: clean  ## Remove pipeline outputs too (data/, logs/, work/).
 	rm -rf $(DATA_DIR) $(LOG_DIR) work/ .nextflow*
 
 # =============================================================================
+# stage 0 — container pull (HPC)
+# =============================================================================
+.PHONY: hpc-pull
+hpc-pull:  ## Pull a Docker Hub image -> containers/versefusion.sif on Warrior HPC.
+	mkdir -p containers logs
+	bash scripts/hpc_pull.sh
+
+.PHONY: hpc-pull-slurm
+hpc-pull-slurm:  ## Submit hpc-pull as a SLURM job.
+	mkdir -p $(LOG_DIR)
+	sbatch slurm/hpc_pull.sh
+
+# =============================================================================
 # stage 1 — download
 # =============================================================================
 .PHONY: download
