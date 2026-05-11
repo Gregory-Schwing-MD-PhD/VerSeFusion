@@ -65,6 +65,18 @@ CONTAINER_SIF="${CONTAINER_SIF:-${REPO_ROOT}/containers/versefusion.sif}"
 
 mkdir -p "${LOG_DIR}"
 
+# --- make src/ importable as `verse_pipeline` without pip install -e . -------
+# Both the host conda env and the reused CTSpinoPelvic1K container lack
+# `verse_pipeline`; pointing PYTHONPATH at src/ keeps things working without
+# either an install step or a dedicated VerSeFusion image.  REPO_ROOT is
+# bind-mounted into every singularity exec (--bind "${REPO_ROOT}:${REPO_ROOT}"),
+# so this path resolves to the same location inside and outside the container.
+# SINGULARITYENV_PYTHONPATH is the explicit, version-safe way to make sure the
+# value crosses the `singularity exec` boundary (Singularity strips most env
+# vars by default in some configs; SINGULARITYENV_* are always passed through).
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+export SINGULARITYENV_PYTHONPATH="${PYTHONPATH}"
+
 echo "============================================================"
 echo "VerSeFusion job"
 echo "  host:           $(hostname)"
