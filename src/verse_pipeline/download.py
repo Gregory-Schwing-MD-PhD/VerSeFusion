@@ -1,32 +1,39 @@
-"""Download the VerSe 2019 + VerSe 2020 BIDS-restructured archives.
+"""Download the VerSe 2019 + VerSe 2020 BIDS-restructured archives from OSF.
 
-The recommended distribution lives on the TUM bonescreen S3 bucket:
+The original S3 distribution at ``s3.bonescreen.de`` has been offline since
+May 2024 (see https://github.com/anjany/verse/issues/17).  The same
+BIDS-restructured ("subject-based") data is available on OSF under
+separate child nodes that the upstream README never linked to:
 
-    https://s3.bonescreen.de/public/VerSe-complete/dataset-verse{19,20}{training,validation,test}.zip
+    VerSe 2019 subject-based:  https://osf.io/jtfa5/
+    VerSe 2020 subject-based:  https://osf.io/4skx2/
 
-Each release ships as three zips (training / validation / test).  All six
-zips together total ~30 GB and are mirrored from the canonical OSF
-repositories (osf.io/nqjyw, osf.io/t98fz) with the *restructured* annotation
-format the maintainers recommend.
+This module talks to OSF's public REST API directly (no osfclient or other
+new dependency — uses the same ``requests`` already in the stack):
 
-This script is:
-    * resumable — uses HTTP Range headers; partial .part files are reused
-    * idempotent — already-downloaded archives are skipped
-    * atomic — files are written to <name>.part and renamed only on success
-    * integrity-checked — sha256 hashes are recorded in a manifest
-    * unpack-once — extraction is gated on a .extracted marker
+    https://api.osf.io/v2/nodes/<node_id>/files/osfstorage/
+
+The downloader:
+
+  * Recurses the OSF folder tree, downloading every file to a local path
+    that mirrors the remote layout.
+  * Is resumable — already-downloaded files (matching expected size) are
+    skipped on re-run.
+  * Atomically renames each file (``.part`` -> final) so a partial download
+    is never confused for a complete one.
+  * Extracts any ``.zip`` files in place, gated on a per-zip
+    ``.extracted`` marker so unpack is idempotent.
+  * Writes a ``download_manifest.json`` summarising every file fetched.
 
 Usage
 -----
     python -m verse_pipeline.download --out_dir data/raw
     python -m verse_pipeline.download --out_dir data/raw --release verse20
-    python -m verse_pipeline.download --out_dir data/raw --skip_extract
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
@@ -43,240 +50,328 @@ from tqdm import tqdm
 # constants
 # =============================================================================
 
-S3_BASE = "https://s3.bonescreen.de/public/VerSe-complete"
+OSF_API_BASE = "https://api.osf.io/v2"
 
-# (release, split) -> zip filename on S3
-RELEASES: dict[str, list[tuple[str, str]]] = {
-    "verse19": [
-        ("training",   "dataset-verse19training.zip"),
-        ("validation", "dataset-verse19validation.zip"),
-        ("test",       "dataset-verse19test.zip"),
-    ],
-    "verse20": [
-        ("training",   "dataset-verse20training.zip"),
-        ("validation", "dataset-verse20validation.zip"),
-        ("test",       "dataset-verse20test.zip"),
-    ],
+# release id -> OSF node id holding the subject-based (BIDS-restructured) data.
+# These ids were surfaced in https://github.com/anjany/verse/issues/17 (the
+# upstream maintainers host both the MICCAI-challenge layout AND the
+# BIDS-restructured layout on OSF, but only link to the MICCAI nodes in the
+# README; the BIDS-restructured child nodes are jtfa5 / 4skx2).
+RELEASES: dict[str, str] = {
+    "verse19": "jtfa5",
+    "verse20": "4skx2",
 }
 
-CHUNK_SIZE = 1024 * 1024  # 1 MiB
+CHUNK_SIZE = 1 << 20            # 1 MiB
 TIMEOUT_SECONDS = 120
 USER_AGENT = "VerSeFusion/0.1.0 (https://github.com/gschwing/VerSeFusion)"
+
+# OSF rate-limits its API to ~100 req/min per IP for unauthenticated callers.
+# Sleep this long between listing requests to stay well under the cap, and
+# back off on HTTP 429 with exponential delay.
+OSF_LIST_THROTTLE_SECONDS = 0.8
+OSF_LIST_MAX_RETRIES = 6
 
 log = logging.getLogger("verse.download")
 
 
 # =============================================================================
-# dataclasses
+# OSF tree walker
 # =============================================================================
 
 @dataclass
-class Archive:
-    """One S3 zip to fetch."""
-    release: str          # "verse19" | "verse20"
-    split:   str          # "training" | "validation" | "test"
-    filename: str         # e.g. "dataset-verse19training.zip"
-
-    @property
-    def url(self) -> str:
-        return f"{S3_BASE}/{self.filename}"
-
-    def out_zip(self, raw_dir: Path) -> Path:
-        return raw_dir / self.release / "downloads" / self.filename
-
-    def part_zip(self, raw_dir: Path) -> Path:
-        return self.out_zip(raw_dir).with_suffix(self.out_zip(raw_dir).suffix + ".part")
-
-    def extracted_marker(self, raw_dir: Path) -> Path:
-        # one marker per archive — uniqueness comes from the filename stem.
-        stem = self.filename.removesuffix(".zip")
-        return raw_dir / self.release / "downloads" / f".{stem}.extracted"
-
-    def extract_root(self, raw_dir: Path) -> Path:
-        return raw_dir / self.release / self.split
+class OSFEntry:
+    """One file or folder returned by the OSF REST API."""
+    kind:        str               # "file" | "folder"
+    name:        str
+    materialized_path: str         # absolute path within osfstorage, e.g. "/01_training/raw.../foo.nii.gz"
+    size_bytes:  int | None        # None for folders
+    download_url: str | None       # None for folders
+    folder_url:  str | None        # listing URL for the folder's contents
 
 
-@dataclass
-class DownloadReport:
-    """Per-run summary written to <raw_dir>/download_manifest.json."""
-    archives: list[dict] = field(default_factory=list)
+def _osf_get_json(url: str, session: requests.Session) -> dict:
+    """GET an OSF API URL, with throttle + exponential backoff on 429.
 
-    def add(self, archive: Archive, *, status: str, size_bytes: int, sha256: str | None) -> None:
-        self.archives.append({
-            "release":     archive.release,
-            "split":       archive.split,
-            "filename":    archive.filename,
-            "url":         archive.url,
-            "status":      status,                # "downloaded" | "cached" | "extracted" | "skipped" | "failed"
-            "size_bytes":  size_bytes,
-            "sha256":      sha256,
-        })
-
-
-# =============================================================================
-# core download
-# =============================================================================
-
-def _http_size(url: str, session: requests.Session) -> int | None:
-    """HEAD the URL to discover Content-Length.  Returns None if unavailable."""
-    try:
-        r = session.head(url, allow_redirects=True, timeout=TIMEOUT_SECONDS)
-        r.raise_for_status()
-        cl = r.headers.get("Content-Length")
-        return int(cl) if cl is not None else None
-    except (requests.RequestException, ValueError):
-        return None
-
-
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _download_resumable(url: str, part_path: Path, session: requests.Session) -> int:
-    """Resumable download to <part_path>.  Returns the final byte count.
-
-    If <part_path> already exists, sends a Range: bytes=<n>- header and appends
-    the remaining bytes.  Falls back to a fresh download if the server replies
-    with 200 instead of 206 (i.e. ignores the Range header).
+    OSF returns HTTP 429 if the unauthenticated rate limit (~100 req/min) is
+    breached.  We sleep ``OSF_LIST_THROTTLE_SECONDS`` before every request to
+    stay under the cap, and on 429 we back off (2s, 4s, 8s, ...) up to
+    ``OSF_LIST_MAX_RETRIES`` times before giving up.
     """
-    part_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = part_path.stat().st_size if part_path.exists() else 0
+    import time
 
-    headers = {"User-Agent": USER_AGENT}
-    if existing > 0:
-        headers["Range"] = f"bytes={existing}-"
-        log.info("Resuming download from byte %d: %s", existing, part_path.name)
-
-    with session.get(url, headers=headers, stream=True, timeout=TIMEOUT_SECONDS) as r:
+    delay = 2.0
+    for attempt in range(OSF_LIST_MAX_RETRIES + 1):
+        time.sleep(OSF_LIST_THROTTLE_SECONDS)
+        r = session.get(url, timeout=TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT})
+        if r.status_code == 429:
+            # honour Retry-After if the server sent one, else exponential
+            retry_after = r.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after and retry_after.isdigit() else delay
+            if attempt < OSF_LIST_MAX_RETRIES:
+                log.warning(
+                    "OSF 429 on %s — sleeping %.1fs (retry %d/%d)",
+                    url, wait, attempt + 1, OSF_LIST_MAX_RETRIES,
+                )
+                time.sleep(wait)
+                delay = min(delay * 2, 60.0)
+                continue
         r.raise_for_status()
+        return r.json()
+    # Exhausted retries; raise so the caller logs and continues.
+    raise requests.HTTPError(f"OSF rate limit exceeded after {OSF_LIST_MAX_RETRIES} retries: {url}")
 
-        # If we asked for a Range but got a 200, the server doesn't support
-        # resume — restart from zero.
-        mode = "ab"
-        if existing > 0 and r.status_code == 200:
-            log.warning("Server ignored Range header — restarting download fresh: %s", url)
-            existing = 0
-            part_path.unlink(missing_ok=True)
-            mode = "wb"
 
-        total = int(r.headers.get("Content-Length", "0")) + existing
-        pbar = tqdm(
-            total=total if total > 0 else None,
-            initial=existing,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-            desc=part_path.name,
-            leave=False,
+def _parse_entry(item: dict) -> OSFEntry:
+    a = item["attributes"]
+    kind = a.get("kind", "file")
+    name = a.get("name", "?")
+    mpath = a.get("materialized_path") or a.get("path") or f"/{name}"
+    size = a.get("size")
+    links = item.get("links", {})
+    download_url = links.get("download") if kind == "file" else None
+
+    folder_url = None
+    if kind == "folder":
+        try:
+            folder_url = item["relationships"]["files"]["links"]["related"]["href"]
+        except KeyError:
+            folder_url = None
+
+    return OSFEntry(
+        kind=kind,
+        name=name,
+        materialized_path=mpath,
+        size_bytes=int(size) if size is not None else None,
+        download_url=download_url,
+        folder_url=folder_url,
+    )
+
+
+def list_storage_recursive(node_id: str, session: requests.Session) -> list[OSFEntry]:
+    """Walk every file in <node_id>'s osfstorage, recursing into folders.
+
+    Returns a flat list of file-kind ``OSFEntry`` records (folders are not
+    emitted; only files).  Failed folder listings are retried at the end of
+    the walk; if any still fail after the retry pass, a warning is logged
+    with the count so the caller knows the inventory may be incomplete.
+    """
+    seed_url = f"{OSF_API_BASE}/nodes/{node_id}/files/osfstorage/?page[size]=100"
+    files: list[OSFEntry] = []
+    queue: list[str] = [seed_url]
+    visited: set[str] = set()
+    failed: set[str] = set()
+
+    def _drain(q: list[str]) -> None:
+        while q:
+            url = q.pop()
+            if url in visited:
+                continue
+            visited.add(url)
+
+            try:
+                payload = _osf_get_json(url, session)
+            except requests.RequestException as e:
+                log.error("Failed to list %s: %s", url, e)
+                failed.add(url)
+                continue
+
+            for item in payload.get("data", []):
+                entry = _parse_entry(item)
+                if entry.kind == "file":
+                    files.append(entry)
+                elif entry.kind == "folder" and entry.folder_url:
+                    q.append(entry.folder_url)
+
+            # JSON:API pagination
+            next_url = payload.get("links", {}).get("next")
+            if next_url:
+                q.append(next_url)
+
+    _drain(queue)
+
+    # Retry pass — give any 429'd folders a second chance now that the
+    # initial burst has subsided.
+    if failed:
+        log.warning(
+            "Retrying %d folder listing(s) that failed on first pass…", len(failed),
+        )
+        retry_queue = list(failed)
+        failed.clear()
+        # Re-allow these URLs (clear them from visited so _drain refetches).
+        for u in retry_queue:
+            visited.discard(u)
+        _drain(retry_queue)
+
+    if failed:
+        log.warning(
+            "%d folder listing(s) STILL failed after retry — inventory may be incomplete. "
+            "Re-run `make download-slurm` to pick up missed files.",
+            len(failed),
         )
 
-        with part_path.open(mode) as f:
-            for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                pbar.update(len(chunk))
-        pbar.close()
-
-    return part_path.stat().st_size
+    return files
 
 
-def _verify_zip(zip_path: Path) -> bool:
-    """Return True iff <zip_path> opens cleanly and its CRCs check out."""
+# =============================================================================
+# per-file download
+# =============================================================================
+
+def _local_path(entry: OSFEntry, release_root: Path) -> Path:
+    """Compute the local destination for an OSF file, mirroring remote layout."""
+    rel = entry.materialized_path.lstrip("/")
+    return release_root / rel
+
+
+def download_file(
+    entry: OSFEntry,
+    release_root: Path,
+    session: requests.Session,
+) -> tuple[Path, str]:
+    """Download one OSF file.  Returns (local_path, status).
+
+    Status values:
+        "downloaded" — fetched from OSF this run.
+        "cached"     — already present locally at the expected size.
+        "failed"     — fetch errored; .part file (if any) left behind.
+    """
+    dst = _local_path(entry, release_root)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # already-complete file?
+    if dst.is_file():
+        if entry.size_bytes is None or dst.stat().st_size == entry.size_bytes:
+            return dst, "cached"
+        log.warning(
+            "Local %s size %d != remote %d; re-downloading",
+            dst, dst.stat().st_size, entry.size_bytes,
+        )
+        dst.unlink()
+
+    part = dst.with_suffix(dst.suffix + ".part")
+    if part.exists():
+        part.unlink()
+
+    if not entry.download_url:
+        log.error("No download URL for %s", entry.materialized_path)
+        return dst, "failed"
+
     try:
-        with zipfile.ZipFile(zip_path) as zf:
-            bad = zf.testzip()
-            if bad is not None:
-                log.error("Zip CRC failure at %s in %s", bad, zip_path)
-                return False
-        return True
-    except zipfile.BadZipFile as e:
-        log.error("BadZipFile for %s: %s", zip_path, e)
-        return False
+        with session.get(
+            entry.download_url,
+            stream=True,
+            timeout=TIMEOUT_SECONDS,
+            headers={"User-Agent": USER_AGENT},
+        ) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("Content-Length", "0")) or entry.size_bytes or 0
+            with part.open("wb") as f, tqdm(
+                total=total if total > 0 else None,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=entry.name,
+                leave=False,
+            ) as pbar:
+                for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    pbar.update(len(chunk))
+    except requests.RequestException as e:
+        log.error("Download failed for %s: %s", entry.materialized_path, e)
+        return dst, "failed"
+
+    os.replace(part, dst)        # atomic
+    return dst, "downloaded"
 
 
-def _extract_zip(zip_path: Path, dest_root: Path) -> None:
-    """Extract <zip_path> into <dest_root>.  Caller must guarantee idempotency."""
-    dest_root.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as zf:
-        members = zf.namelist()
-        for m in tqdm(members, desc=f"extract {zip_path.name}", leave=False):
-            zf.extract(m, dest_root)
+# =============================================================================
+# zip extraction (post-download)
+# =============================================================================
+
+def extract_zips(release_root: Path) -> list[Path]:
+    """Extract every .zip under <release_root> in place, idempotently.
+
+    Each zip leaves a sibling .extracted marker so re-runs are no-ops.
+    Returns the list of zips actually extracted on this call.
+    """
+    extracted: list[Path] = []
+    for zip_path in sorted(release_root.rglob("*.zip")):
+        marker = zip_path.with_suffix(zip_path.suffix + ".extracted")
+        if marker.exists():
+            continue
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                bad = zf.testzip()
+                if bad is not None:
+                    log.error("Zip CRC failure at %s in %s", bad, zip_path)
+                    continue
+                members = zf.namelist()
+                for m in tqdm(members, desc=f"extract {zip_path.name}", leave=False):
+                    zf.extract(m, zip_path.parent)
+            marker.write_text(json.dumps({"members": len(members)}, indent=2))
+            extracted.append(zip_path)
+            log.info("Extracted %s", zip_path)
+        except zipfile.BadZipFile as e:
+            log.error("BadZipFile for %s: %s", zip_path, e)
+    return extracted
 
 
 # =============================================================================
 # orchestration
 # =============================================================================
 
-def fetch_archive(
-    archive: Archive,
+@dataclass
+class DownloadReport:
+    files: list[dict] = field(default_factory=list)
+    n_downloaded: int = 0
+    n_cached:     int = 0
+    n_failed:     int = 0
+    n_extracted_zips: int = 0
+
+
+def fetch_release(
+    release: str,
+    node_id: str,
     raw_dir: Path,
     session: requests.Session,
-    *,
-    extract: bool,
     report: DownloadReport,
 ) -> None:
-    """Download + verify + (optionally) extract one archive."""
-    out_zip = archive.out_zip(raw_dir)
-    part_zip = archive.part_zip(raw_dir)
-    marker = archive.extracted_marker(raw_dir)
-    extract_root = archive.extract_root(raw_dir)
+    release_root = raw_dir / release
+    release_root.mkdir(parents=True, exist_ok=True)
 
-    # ---- 1. download ----------------------------------------------------------
-    if out_zip.exists():
-        log.info("Already have %s (size=%d)", out_zip.name, out_zip.stat().st_size)
-        status_download = "cached"
-    else:
-        try:
-            _download_resumable(archive.url, part_zip, session)
-        except requests.RequestException as e:
-            log.error("Download failed for %s: %s", archive.url, e)
-            report.add(archive, status="failed", size_bytes=0, sha256=None)
-            return
+    log.info("=" * 70)
+    log.info("Release: %s  (OSF node: %s)", release, node_id)
+    log.info("Listing files via OSF REST API…")
 
-        if not _verify_zip(part_zip):
-            log.error("Zip verification failed — leaving .part for inspection: %s", part_zip)
-            report.add(archive, status="failed", size_bytes=part_zip.stat().st_size, sha256=None)
-            return
+    files = list_storage_recursive(node_id, session)
+    log.info("Discovered %d file(s) on OSF for %s", len(files), release)
 
-        os.replace(part_zip, out_zip)   # atomic rename
-        status_download = "downloaded"
-
-    size = out_zip.stat().st_size
-    sha = _sha256_file(out_zip)
-    log.info("OK %s  size=%d  sha256=%s", out_zip.name, size, sha[:16])
-
-    # ---- 2. extract -----------------------------------------------------------
-    if not extract:
-        report.add(archive, status=status_download, size_bytes=size, sha256=sha)
+    if not files:
+        log.error("OSF returned no files for node %s — aborting %s", node_id, release)
         return
 
-    if marker.exists():
-        log.info("Already extracted: %s", archive.filename)
-        report.add(archive, status="extracted", size_bytes=size, sha256=sha)
-        return
+    for entry in files:
+        dst, status = download_file(entry, release_root, session)
+        report.files.append({
+            "release":   release,
+            "node_id":   node_id,
+            "remote":    entry.materialized_path,
+            "local":     str(dst),
+            "size_bytes": entry.size_bytes,
+            "status":    status,
+        })
+        if status == "downloaded":
+            report.n_downloaded += 1
+        elif status == "cached":
+            report.n_cached += 1
+        else:
+            report.n_failed += 1
 
-    try:
-        _extract_zip(out_zip, extract_root)
-        marker.write_text(json.dumps({"sha256": sha, "size_bytes": size}, indent=2))
-        report.add(archive, status="extracted", size_bytes=size, sha256=sha)
-    except (zipfile.BadZipFile, OSError) as e:
-        log.error("Extraction failed for %s: %s", out_zip, e)
-        report.add(archive, status="failed", size_bytes=size, sha256=sha)
-
-
-def select_archives(releases: Iterable[str]) -> list[Archive]:
-    archives: list[Archive] = []
-    for release in releases:
-        if release not in RELEASES:
-            raise SystemExit(f"Unknown release: {release}.  Pick from {list(RELEASES)}")
-        for split, filename in RELEASES[release]:
-            archives.append(Archive(release=release, split=split, filename=filename))
-    return archives
+    log.info("Extracting any .zip files under %s…", release_root)
+    extracted = extract_zips(release_root)
+    report.n_extracted_zips += len(extracted)
 
 
 # =============================================================================
@@ -286,7 +381,11 @@ def select_archives(releases: Iterable[str]) -> list[Archive]:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="verse-download",
-        description="Download the VerSe 2019 + VerSe 2020 BIDS-restructured archives.",
+        description=(
+            "Download the VerSe 2019 + VerSe 2020 BIDS-restructured data "
+            "from OSF (the s3.bonescreen.de endpoint has been offline since "
+            "May 2024; see https://github.com/anjany/verse/issues/17)."
+        ),
     )
     p.add_argument(
         "--out_dir",
@@ -299,11 +398,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         choices=list(RELEASES),
         help="Limit to specific release(s).  Pass multiple times.  Default: both.",
-    )
-    p.add_argument(
-        "--skip_extract",
-        action="store_true",
-        help="Download only; leave zips packed.",
     )
     p.add_argument(
         "--log_level",
@@ -321,41 +415,40 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     releases = args.release or list(RELEASES)
-    archives = select_archives(releases)
-    log.info("Planning download of %d archive(s) across %d release(s)", len(archives), len(releases))
+    log.info("Planning OSF pull for releases: %s", releases)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     report = DownloadReport()
 
     with requests.Session() as session:
         session.headers.update({"User-Agent": USER_AGENT})
-        for archive in archives:
-            log.info("=" * 70)
-            log.info("Archive: %s/%s  (%s)", archive.release, archive.split, archive.filename)
-            log.info("URL:     %s", archive.url)
-            fetch_archive(
-                archive,
-                raw_dir=args.out_dir,
-                session=session,
-                extract=not args.skip_extract,
-                report=report,
-            )
+        for release in releases:
+            node_id = RELEASES[release]
+            fetch_release(release, node_id, args.out_dir, session, report)
 
-    # ---- final manifest ------------------------------------------------------
+    # ---- summary manifest ---------------------------------------------------
     manifest_path = args.out_dir / "download_manifest.json"
     manifest_path.write_text(json.dumps({
-        "archives": report.archives,
-        "n_archives": len(report.archives),
-        "out_dir": str(args.out_dir.resolve()),
-        "version": "0.1.0",
+        "source":           "osf",
+        "osf_node_map":     RELEASES,
+        "n_files":          len(report.files),
+        "n_downloaded":     report.n_downloaded,
+        "n_cached":         report.n_cached,
+        "n_failed":         report.n_failed,
+        "n_extracted_zips": report.n_extracted_zips,
+        "files":            report.files,
+        "version":          "0.2.0",
     }, indent=2))
     log.info("Wrote manifest -> %s", manifest_path)
 
-    n_failed = sum(1 for a in report.archives if a["status"] == "failed")
-    if n_failed:
-        log.error("%d / %d archives failed.  See %s.", n_failed, len(report.archives), manifest_path)
+    log.info(
+        "Summary: %d downloaded, %d cached, %d failed, %d zips extracted",
+        report.n_downloaded, report.n_cached, report.n_failed, report.n_extracted_zips,
+    )
+
+    if report.n_failed:
+        log.error("%d file(s) failed — re-run to retry (downloads are resumable).", report.n_failed)
         return 1
-    log.info("All %d archives OK.", len(report.archives))
     return 0
 
 

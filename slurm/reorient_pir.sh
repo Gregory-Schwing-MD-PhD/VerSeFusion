@@ -10,7 +10,10 @@
 #SBATCH --error=logs/verse-reorient-%j.err
 #SBATCH --mail-type=END,FAIL
 
-. "$(dirname "$0")/_common.sh"
+set -euo pipefail
+
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
+. slurm/_common.sh
 
 singularity exec \
     --bind "${REPO_ROOT}:${REPO_ROOT}" \

@@ -13,7 +13,13 @@
 # Pull the six VerSe S3 zips on Warrior HPC.
 # 30 GB total; 8h is generous and accounts for spotty S3 throughput.
 
-. "$(dirname "$0")/_common.sh"
+set -euo pipefail
+
+# SLURM copies the script body to a temp dir, so $0 / $(dirname $0) point
+# nowhere useful.  Anchor on SLURM_SUBMIT_DIR (always set by sbatch) so
+# _common.sh resolves to the real repo path.
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
+. slurm/_common.sh
 
 singularity exec \
     --bind "${REPO_ROOT}:${REPO_ROOT}" \

@@ -3,7 +3,9 @@
 # Shared SLURM preamble.
 #
 # Every slurm/*.sh script in this repo sources this file via
-# `. "$(dirname "$0")/_common.sh"`.  It is responsible for:
+# `. slurm/_common.sh` (the caller must `cd "${SLURM_SUBMIT_DIR:-$(pwd)}"`
+# first, so this path resolves to the real repo location rather than the
+# SLURM temp dir).  It is responsible for:
 #
 #   1. Scrubbing leaky host env vars that can corrupt the job
 #      (JAVA_HOME, LD_LIBRARY_PATH, PYTHONPATH, R_LIBS*).
@@ -14,10 +16,12 @@
 #      XDG_RUNTIME_DIR, NXF_SINGULARITY_CACHEDIR).
 #   4. Loading non-secret defaults from configs/default.env and the
 #      gitignored secrets layer from env.local (if either exists).
+#   5. Exporting PYTHONPATH (+ SINGULARITYENV_PYTHONPATH) so
+#      `verse_pipeline` is importable without `pip install -e .`.
 #
 # After this file is sourced, the calling script has:
 #   REPO_ROOT, DATA_DIR, RAW_DIR, UNIFIED_DIR, REORIENTED_DIR,
-#   HF_DIR, LOG_DIR, CONTAINER_SIF — all guaranteed non-empty.
+#   HF_DIR, LOG_DIR, CONTAINER_SIF, PYTHONPATH — all guaranteed non-empty.
 # =============================================================================
 
 set -euo pipefail
@@ -43,9 +47,12 @@ export NXF_SINGULARITY_HOME_MOUNT=true
 unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 # --- load non-secret defaults -------------------------------------------------
+# Regex must include digits so VERSE19_ZIPS etc. aren't filtered out.
+# default.env holds only single-word scalars; multi-word lists and path
+# expressions are NOT supported here — see configs/default.env header.
 if [[ -f configs/default.env ]]; then
     # shellcheck disable=SC1091
-    set -a; source <(grep -E '^[A-Z_]+=' configs/default.env); set +a
+    set -a; source <(grep -E '^[A-Z0-9_]+=' configs/default.env); set +a
 fi
 
 # --- optional secrets layer ---------------------------------------------------
@@ -54,7 +61,7 @@ if [[ -f env.local ]]; then
     set -a; source env.local; set +a
 fi
 
-# --- defaults the env files may not set --------------------------------------
+# --- defaults the env files do not set (paths live here, not in default.env) -
 DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs}"
 RAW_DIR="${RAW_DIR:-${DATA_DIR}/raw}"
@@ -71,9 +78,8 @@ mkdir -p "${LOG_DIR}"
 # either an install step or a dedicated VerSeFusion image.  REPO_ROOT is
 # bind-mounted into every singularity exec (--bind "${REPO_ROOT}:${REPO_ROOT}"),
 # so this path resolves to the same location inside and outside the container.
-# SINGULARITYENV_PYTHONPATH is the explicit, version-safe way to make sure the
-# value crosses the `singularity exec` boundary (Singularity strips most env
-# vars by default in some configs; SINGULARITYENV_* are always passed through).
+# SINGULARITYENV_PYTHONPATH guarantees the value crosses the
+# `singularity exec` boundary regardless of host-env strip policy.
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export SINGULARITYENV_PYTHONPATH="${PYTHONPATH}"
 
@@ -84,5 +90,6 @@ echo "  date:           $(date -Iseconds)"
 echo "  repo:           ${REPO_ROOT}"
 echo "  DATA_DIR:       ${DATA_DIR}"
 echo "  CONTAINER_SIF:  ${CONTAINER_SIF}"
+echo "  PYTHONPATH:     ${PYTHONPATH}"
 echo "  SLURM_JOB_ID:   ${SLURM_JOB_ID:-N/A}"
 echo "============================================================"
