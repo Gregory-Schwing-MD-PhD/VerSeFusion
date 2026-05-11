@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=verse-reorient
+#SBATCH -q primary
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=02:00:00
 #SBATCH --output=logs/verse-reorient-%j.out
 #SBATCH --error=logs/verse-reorient-%j.err
-#SBATCH --partition=compute
-#SBATCH --qos=normal
-#SBATCH --time=02:00:00
-#SBATCH --mem=16G
-#SBATCH --cpus-per-task=4
+#SBATCH --mail-type=END,FAIL
 
 . "$(dirname "$0")/_common.sh"
 

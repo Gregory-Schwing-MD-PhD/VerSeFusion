@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=verse-lstv-audit
+#SBATCH -q primary
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=00:10:00
 #SBATCH --output=logs/verse-lstv-audit-%j.out
 #SBATCH --error=logs/verse-lstv-audit-%j.err
-#SBATCH --partition=compute
-#SBATCH --qos=normal
-#SBATCH --time=00:10:00
-#SBATCH --mem=4G
-#SBATCH --cpus-per-task=1
+#SBATCH --mail-type=END,FAIL
 
 . "$(dirname "$0")/_common.sh"
 

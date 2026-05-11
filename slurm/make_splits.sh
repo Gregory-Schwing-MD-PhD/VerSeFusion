@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=verse-splits
+#SBATCH -q primary
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=00:15:00
 #SBATCH --output=logs/verse-splits-%j.out
 #SBATCH --error=logs/verse-splits-%j.err
-#SBATCH --partition=compute
-#SBATCH --qos=normal
-#SBATCH --time=00:15:00
-#SBATCH --mem=4G
-#SBATCH --cpus-per-task=1
+#SBATCH --mail-type=END,FAIL
 
 . "$(dirname "$0")/_common.sh"
 

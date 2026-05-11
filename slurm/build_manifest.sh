@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=verse-manifest
+#SBATCH -q primary
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=8G
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/verse-manifest-%j.out
 #SBATCH --error=logs/verse-manifest-%j.err
-#SBATCH --partition=compute
-#SBATCH --qos=normal
-#SBATCH --time=00:30:00
-#SBATCH --mem=8G
-#SBATCH --cpus-per-task=2
+#SBATCH --mail-type=END,FAIL
 
 . "$(dirname "$0")/_common.sh"
 

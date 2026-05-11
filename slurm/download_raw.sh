@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=verse-download
+#SBATCH -q primary
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=8G
+#SBATCH --time=08:00:00
 #SBATCH --output=logs/verse-download-%j.out
 #SBATCH --error=logs/verse-download-%j.err
-#SBATCH --partition=compute
-#SBATCH --qos=normal
-#SBATCH --time=08:00:00
-#SBATCH --mem=8G
-#SBATCH --cpus-per-task=4
+#SBATCH --mail-type=END,FAIL
 
 # Pull the six VerSe S3 zips on Warrior HPC.
 # 30 GB total; 8h is generous and accounts for spotty S3 throughput.

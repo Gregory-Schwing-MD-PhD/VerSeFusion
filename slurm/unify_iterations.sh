@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=verse-unify
+#SBATCH -q primary
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=8G
+#SBATCH --time=01:00:00
 #SBATCH --output=logs/verse-unify-%j.out
 #SBATCH --error=logs/verse-unify-%j.err
-#SBATCH --partition=compute
-#SBATCH --qos=normal
-#SBATCH --time=01:00:00
-#SBATCH --mem=8G
-#SBATCH --cpus-per-task=2
+#SBATCH --mail-type=END,FAIL
 
 . "$(dirname "$0")/_common.sh"
 
