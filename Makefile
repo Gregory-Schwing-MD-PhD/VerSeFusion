@@ -26,6 +26,7 @@ endif
 DATA_DIR       ?= $(CURDIR)/data
 RAW_DIR        ?= $(DATA_DIR)/raw
 UNIFIED_DIR    ?= $(DATA_DIR)/unified
+CORRECTED_DIR  ?= $(DATA_DIR)/corrected
 REORIENTED_DIR ?= $(DATA_DIR)/reoriented
 HF_DIR         ?= $(DATA_DIR)/hf_export
 LOG_DIR        ?= $(CURDIR)/logs
@@ -54,6 +55,7 @@ help:  ## Show this help.
 	@echo "  DATA_DIR       = $(DATA_DIR)"
 	@echo "  RAW_DIR        = $(RAW_DIR)"
 	@echo "  UNIFIED_DIR    = $(UNIFIED_DIR)"
+	@echo "  CORRECTED_DIR  = $(CORRECTED_DIR)"
 	@echo "  REORIENTED_DIR = $(REORIENTED_DIR)"
 	@echo "  HF_DIR         = $(HF_DIR)"
 	@echo ""
@@ -86,10 +88,10 @@ hpc-pull-slurm:  ## Submit hpc-pull as a SLURM job.
 	sbatch slurm/hpc_pull.sh
 
 # =============================================================================
-# stage 1 — download
+# stage 1 — download (OSF)
 # =============================================================================
 .PHONY: download
-download:  ## Pull the six VerSe S3 zips (resumable, sha256 verified).
+download:  ## Pull the VerSe BIDS data from OSF (~1465 files, resumable).
 	mkdir -p $(RAW_DIR) $(LOG_DIR)
 	$(PYTHON) -m verse_pipeline.download --out_dir $(RAW_DIR)
 
@@ -102,41 +104,67 @@ download-slurm:  ## Submit download as a SLURM job.
 # stage 2 — unify
 # =============================================================================
 .PHONY: unify
-unify:  ## Merge VerSe19+VerSe20, dedup 105-image overlap (VerSe20 wins).
+unify:  ## Merge VerSe19+VerSe20, dedup, flatten to data/unified/sub-*/.
 	mkdir -p $(UNIFIED_DIR) $(LOG_DIR)
 	$(PYTHON) -m verse_pipeline.unify \
 	    --raw_dir $(RAW_DIR) \
 	    --out_dir $(UNIFIED_DIR)
 
 .PHONY: unify-slurm
-unify-slurm:
+unify-slurm:  ## Submit unify as a SLURM job.
+	mkdir -p $(LOG_DIR)
 	sbatch slurm/unify_iterations.sh
+
+# =============================================================================
+# stage 2.5 — VERIDAH (Moeller 2026) label corrections
+# =============================================================================
+.PHONY: correct
+correct:  ## Apply Moeller's manual label corrections to ~25 subjects.
+	mkdir -p $(CORRECTED_DIR) $(LOG_DIR)
+	$(PYTHON) -m verse_pipeline.veridah \
+	    --in_dir          $(UNIFIED_DIR) \
+	    --out_dir         $(CORRECTED_DIR) \
+	    --corrections_csv $(CURDIR)/configs/veridah_corrections.csv
+
+.PHONY: correct-slurm
+correct-slurm:  ## Submit correct as a SLURM job.
+	mkdir -p $(LOG_DIR)
+	sbatch slurm/apply_corrections.sh
 
 # =============================================================================
 # stage 3 — reorient to PIR
 # =============================================================================
 .PHONY: reorient
-reorient:  ## Reorient every CT + mask to PIR (matches CTSpinoPelvic1K).
+reorient:  ## Reorient every CT + mask to PIR.  Prefers corrected/ if it exists.
 	mkdir -p $(REORIENTED_DIR) $(LOG_DIR)
+	@if [ -d "$(CORRECTED_DIR)" ] && [ -n "$$(ls -A $(CORRECTED_DIR) 2>/dev/null)" ]; then \
+	    echo "Reorienting from $(CORRECTED_DIR) (post-VERIDAH)"; \
+	    IN_DIR=$(CORRECTED_DIR); \
+	else \
+	    echo "Reorienting from $(UNIFIED_DIR) (no VERIDAH corrections applied)"; \
+	    IN_DIR=$(UNIFIED_DIR); \
+	fi; \
 	$(PYTHON) -m verse_pipeline.reorient \
-	    --in_dir $(UNIFIED_DIR) \
+	    --in_dir  "$$IN_DIR" \
 	    --out_dir $(REORIENTED_DIR)
 
 .PHONY: reorient-slurm
-reorient-slurm:
+reorient-slurm:  ## Submit reorient as a SLURM job (auto-prefers corrected/).
+	mkdir -p $(LOG_DIR)
 	sbatch slurm/reorient_pir.sh
 
 # =============================================================================
 # stage 4 — manifest + LSTV audit
 # =============================================================================
 .PHONY: manifest
-manifest:  ## Build placed_manifest.json with vertebra inventory + LSTV/T13 flags.
+manifest:  ## Build placed_manifest.json with anomaly flags + VERIDAH provenance.
 	$(PYTHON) -m verse_pipeline.manifest \
-	    --in_dir $(REORIENTED_DIR) \
+	    --in_dir   $(REORIENTED_DIR) \
 	    --out_path $(REORIENTED_DIR)/placed_manifest.json
 
 .PHONY: manifest-slurm
-manifest-slurm:
+manifest-slurm:  ## Submit manifest as a SLURM job.
+	mkdir -p $(LOG_DIR)
 	sbatch slurm/build_manifest.sh
 
 .PHONY: lstv-audit
@@ -148,30 +176,31 @@ lstv-audit:  ## Print LSTV / T13 / normal counts to stdout.
 # stage 5 — splits
 # =============================================================================
 .PHONY: splits
-splits:  ## 5-fold CV stratified by LSTV+T13.
+splits:  ## 5-fold CV stratified by anomaly category.
 	$(PYTHON) -m verse_pipeline.splits \
 	    --manifest $(REORIENTED_DIR)/placed_manifest.json \
-	    --out_dir $(REORIENTED_DIR)/splits
+	    --out_dir  $(REORIENTED_DIR)/splits
 
 # =============================================================================
 # stage 6 — HuggingFace export
 # =============================================================================
 .PHONY: hf-export
-hf-export:  ## Build HuggingFace DatasetDict under data/hf_export/.
+hf-export:  ## Build HuggingFace flat directory under data/hf_export/.
 	mkdir -p $(HF_DIR)
 	$(PYTHON) -m verse_pipeline.hf_export \
-	    --in_dir $(REORIENTED_DIR) \
+	    --in_dir  $(REORIENTED_DIR) \
 	    --out_dir $(HF_DIR)
 
 .PHONY: hf-export-slurm
-hf-export-slurm:
+hf-export-slurm:  ## Submit hf-export as a SLURM job.
+	mkdir -p $(LOG_DIR)
 	sbatch slurm/hf_export.sh
 
 # =============================================================================
 # QA / utility
 # =============================================================================
 .PHONY: inventory
-inventory:  ## Print per-source / per-split subject counts.
+inventory:  ## Print per-source / per-split / per-anomaly subject counts.
 	$(PYTHON) -m verse_pipeline.cli_inventory \
 	    --manifest $(REORIENTED_DIR)/placed_manifest.json
 
@@ -185,5 +214,5 @@ lint:  ## Run ruff + mypy.
 	$(PYTHON) -m mypy src/
 
 .PHONY: full-pipeline
-full-pipeline: download unify reorient manifest splits hf-export  ## Run every stage end-to-end (local).
+full-pipeline: download unify correct reorient manifest splits hf-export  ## Run every stage end-to-end (local).
 	@echo "Full pipeline complete.  Output at $(HF_DIR)"
