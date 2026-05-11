@@ -1,0 +1,83 @@
+# =============================================================================
+# VerSeFusion — gitignore
+#
+# The pipeline writes everything dataset-related under ./data, ./logs,
+# ./work (Nextflow scratch), and ./containers/*.sif.  None of that ever
+# belongs in the repository — the raw VerSe19/VerSe20 archives are CC-BY-SA
+# and easily re-downloaded; everything downstream is reproducible.
+# =============================================================================
+
+# --- pipeline outputs ---------------------------------------------------------
+data/
+work/
+logs/
+.nextflow*
+trace.txt
+report.html
+timeline.html
+dag.dot
+
+# --- containers ---------------------------------------------------------------
+containers/*.sif
+containers/*.img
+
+# --- secrets ------------------------------------------------------------------
+env.local
+.env
+.envrc
+*.token
+hf_token
+HF_TOKEN
+
+# --- never-commit medical-image extensions ------------------------------------
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+*.raw
+*.dcm
+*.dicom
+*.zip
+*.tar.gz
+*.tar.xz
+*.tar
+!docs/**/*.png        # allow docs imagery
+!assets/**/*.png
+
+# --- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.Python
+build/
+dist/
+.eggs/
+pip-wheel-metadata/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# --- editors / OS -------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Jupyter ------------------------------------------------------------------
+.ipynb_checkpoints/
+
+# --- HuggingFace export staging ----------------------------------------------
+data/hf_export/

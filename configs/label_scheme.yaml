@@ -1,0 +1,99 @@
+# =============================================================================
+# VerSe label scheme + crosswalk to CTSpinoPelvic1K 10-class scheme
+#
+# VerSe labels are 1-indexed integers in the segmentation NIfTI; they index
+# anatomical vertebrae and (in two cases) skeletal regions.  Sacrum (26) and
+# coccyx (27) appear in the *scheme* but are NOT annotated in any VerSe scan —
+# VerSe is a vertebrae-only corpus.
+# =============================================================================
+
+verse:
+  scheme_name: "VerSe canonical 28-class"
+  source: "https://github.com/anjany/verse#data"
+
+  labels:
+    # cervical
+    1:  { region: cervical,  name: C1 }
+    2:  { region: cervical,  name: C2 }
+    3:  { region: cervical,  name: C3 }
+    4:  { region: cervical,  name: C4 }
+    5:  { region: cervical,  name: C5 }
+    6:  { region: cervical,  name: C6 }
+    7:  { region: cervical,  name: C7 }
+
+    # thoracic
+    8:  { region: thoracic,  name: T1  }
+    9:  { region: thoracic,  name: T2  }
+    10: { region: thoracic,  name: T3  }
+    11: { region: thoracic,  name: T4  }
+    12: { region: thoracic,  name: T5  }
+    13: { region: thoracic,  name: T6  }
+    14: { region: thoracic,  name: T7  }
+    15: { region: thoracic,  name: T8  }
+    16: { region: thoracic,  name: T9  }
+    17: { region: thoracic,  name: T10 }
+    18: { region: thoracic,  name: T11 }
+    19: { region: thoracic,  name: T12 }
+
+    # lumbar
+    20: { region: lumbar,    name: L1 }
+    21: { region: lumbar,    name: L2 }
+    22: { region: lumbar,    name: L3 }
+    23: { region: lumbar,    name: L4 }
+    24: { region: lumbar,    name: L5 }
+    25: { region: lumbar,    name: L6, anomaly: lstv,   note: "lumbarized LSTV" }
+
+    # sacrum / coccyx (in scheme, unannotated in VerSe)
+    26: { region: sacrum,    name: sacrum,  annotated: false }
+    27: { region: coccyx,    name: coccyx,  annotated: false }
+
+    # cranial transitional anomaly
+    28: { region: thoracic,  name: T13,     anomaly: t13,  note: "extra thoracic vertebra" }
+
+ctspinopelvic1k:
+  scheme_name: "CTSpinoPelvic1K 10-class"
+  source: "internal"
+
+  labels:
+    0:  { name: background }
+    1:  { name: L1 }
+    2:  { name: L2 }
+    3:  { name: L3 }
+    4:  { name: L4 }
+    5:  { name: L5 }
+    6:  { name: L6, anomaly: lstv }
+    7:  { name: sacrum }
+    8:  { name: left_hip }
+    9:  { name: right_hip }
+    10: { name: ignore }
+
+# =============================================================================
+# Crosswalk: VerSe → CTSpinoPelvic1K
+#
+# Mapping is intentionally LOSSY:
+#   - cervical (VerSe 1-7), thoracic (VerSe 8-19, 28) → dropped (no equivalent)
+#   - VerSe 27 (coccyx) → dropped
+#   - VerSe 26 (sacrum, unannotated) → label 7 if ever annotated
+#
+# Everything not listed maps to 0 (background) in the crosswalked mask.
+# =============================================================================
+crosswalk:
+  verse_to_ctspinopelvic1k:
+    20: 1   # L1 → L1
+    21: 2   # L2 → L2
+    22: 3   # L3 → L3
+    23: 4   # L4 → L4
+    24: 5   # L5 → L5
+    25: 6   # L6 → L6 (LSTV)
+    26: 7   # sacrum → sacrum (only relevant if upstream ever annotates it)
+
+  # Reverse direction is incomplete (no hip labels in VerSe).
+  ctspinopelvic1k_to_verse:
+    1: 20
+    2: 21
+    3: 22
+    4: 23
+    5: 24
+    6: 25
+    7: 26
+    # 8, 9 (hips): no VerSe equivalent — dropped
