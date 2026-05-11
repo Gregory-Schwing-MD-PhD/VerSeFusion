@@ -18,6 +18,8 @@
 #      gitignored secrets layer from env.local (if either exists).
 #   5. Exporting PYTHONPATH (+ SINGULARITYENV_PYTHONPATH) so
 #      `verse_pipeline` is importable without `pip install -e .`.
+#   6. Ensuring DATA_DIR (and all its subdirs) exist on disk before any
+#      singularity exec tries to bind-mount them.
 #
 # After this file is sourced, the calling script has:
 #   REPO_ROOT, DATA_DIR, RAW_DIR, UNIFIED_DIR, REORIENTED_DIR,
@@ -70,7 +72,11 @@ REORIENTED_DIR="${REORIENTED_DIR:-${DATA_DIR}/reoriented}"
 HF_DIR="${HF_DIR:-${DATA_DIR}/hf_export}"
 CONTAINER_SIF="${CONTAINER_SIF:-${REPO_ROOT}/containers/versefusion.sif}"
 
-mkdir -p "${LOG_DIR}"
+# Pre-create every data subdir.  `singularity exec --bind X:X` fails fatally
+# if X doesn't exist on disk, so a `make deep-clean` followed by a SLURM
+# submit would otherwise abort with "mount source doesn't exist".
+mkdir -p "${LOG_DIR}" "${DATA_DIR}" "${RAW_DIR}" \
+         "${UNIFIED_DIR}" "${REORIENTED_DIR}" "${HF_DIR}"
 
 # --- make src/ importable as `verse_pipeline` without pip install -e . -------
 # Both the host conda env and the reused CTSpinoPelvic1K container lack

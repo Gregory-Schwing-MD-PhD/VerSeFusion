@@ -1,0 +1,26 @@
+fid,dataset,vert,T11,T13,LabelOverride,TLTV,SR_l,SR_r
+verse011,dataset-verse19,19,0,0,,0,0,0
+verse119,dataset-verse19,20,0,0,,0,0,0
+verse403_split-verse255,dataset-verse19,20,0,0,,1,0,1
+verse406_split-verse261,dataset-verse19,20,0,0,,0,0,0
+verse411_split-verse270,dataset-verse19,20,0,0,,0,0,0
+verse416_split-verse279,dataset-verse19,20,0,0,,0,0,0
+verse509_dir-iso,dataset-verse20,20,0,1,,1,1,1
+verse512_dir-iso,dataset-verse20,20,0,1,,1,1,1
+verse513,dataset-verse20,20,0,1,,1,1,1
+verse542_dir-iso,dataset-verse20,20,0,0,,1,0,0
+verse557_dir-ax,dataset-verse20,20,0,1,,1,1,1
+verse559,dataset-verse20,20,0,1,"[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]",1,1,1
+verse560_dir-iso,dataset-verse20,20,0,0,,0,0,0
+verse576,dataset-verse20,20,0,1,,1,1,1
+verse587_dir-iso,dataset-verse20,20,0,1,,1,1,1
+verse593_dir-sag,dataset-verse20,20,0,1,,1,1,1
+verse599_dir-iso,dataset-verse20,20,0,1,,1,1,1
+verse606,dataset-verse20,20,0,1,"[6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]",1,1,0
+verse613_dir-iso,dataset-verse20,20,0,1,,1,1,1
+verse620_dir-iso,dataset-verse20,20,0,1,,1,0,1
+verse623,dataset-verse20,20,0,1,,1,1,1
+verse757,dataset-verse20,19,0,0,,0,0,0
+verse765,dataset-verse20,20,0,1,,1,1,1
+verse803_dir-iso,dataset-verse20,20,0,0,,0,0,0
+verse642_dir-sag,dataset-verse20,20,0,0,"[6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]",,,
