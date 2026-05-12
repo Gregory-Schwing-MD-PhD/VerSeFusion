@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import re
 import json
 import logging
 import shutil
@@ -107,12 +108,25 @@ class Correction:
         return "advisory_only"
 
 
+_SUBJECT_CORE_RE = re.compile(r"^(verse\d+|gl\d+)")
+
+
 def _norm_subject(fid: str) -> str:
-    """Strip any ``_dir-*`` variant suffix from the fid to get the bare subject id."""
-    # CSV uses bare "verseNNN"; the unified tree uses "sub-verseNNN".  We
-    # return the bare form ("verseNNN") to match what `discover_subjects`
-    # returns as the subject string.
-    return fid.split("_dir-")[0]
+    """Strip any BIDS entity suffix (_dir-*, _split-*, etc.) from the fid.
+
+    The CSV uses fids like:
+        verse011                       (bare)
+        verse509_dir-iso               (with _dir-)
+        verse403_split-verse255        (with _split- pointing at cross-release id)
+        verse642_dir-sag               (another _dir- variant)
+        gl003                          (alternate-cohort prefix)
+
+    All of those should reduce to the bare subject core (``verse011``,
+    ``verse509``, ``verse403``, ``verse642``, ``gl003``) so they match the
+    ``sub-<core>`` directory names produced by ``unify.py``.
+    """
+    m = _SUBJECT_CORE_RE.match(fid)
+    return m.group(1) if m else fid
 
 
 def load_corrections(csv_path: Path) -> dict[str, Correction]:
@@ -196,24 +210,54 @@ def _t11_shift_remap(mask_labels: Iterable[int]) -> dict[int, int]:
     return remap
 
 
+class LabelOverrideMismatch(Exception):
+    """Raised when an OSF centroid count does not match Moeller's override list."""
+
+    def __init__(self, subject: str, n_centroid: int, n_override: int):
+        self.subject = subject
+        self.n_centroid = n_centroid
+        self.n_override = n_override
+        super().__init__(
+            f"verse{subject}: centroid has {n_centroid} vertebrae but "
+            f"LabelOverride has {n_override} entries — refusing to pair, "
+            f"since min(len) silently mis-labels one end of the spine."
+        )
+
+
 def _label_override_remap(
     correction: Correction,
     centroid: CentroidFile,
+    *,
+    allow_length_mismatch: bool = False,
 ) -> dict[int, int]:
     """Pair the override list with the centroid spatial order to build a remap.
 
     The centroid JSON in PIR (or any orientation; we assume the original
     OSF orientation here) lists vertebrae in cranial->caudal spatial order.
     The override list also runs cranial->caudal.  Match them index-for-index.
+
+    Length-mismatch policy
+    ----------------------
+    By default this raises :class:`LabelOverrideMismatch` if the centroid and
+    override lengths differ.  Silent ``min(len)`` pairing is dangerous for
+    LSTV/T13 work: which end of the spine gets dropped depends on whether
+    OSF is missing a cranial or caudal vertebra, and pairing from the wrong
+    end shifts every label by one — silently re-labelling the anomaly out
+    of the dataset.  Pass ``allow_length_mismatch=True`` to fall back to the
+    legacy ``min(len)`` behaviour (logged as a warning).
     """
     assert correction.label_override is not None
     ordered_old = [c.label for c in centroid.centroids]
     new_seq = correction.label_override
 
     if len(ordered_old) != len(new_seq):
-        log.error(
-            "Length mismatch for %s: centroid has %d vertebrae, "
-            "LabelOverride has %d entries — using min(len)",
+        if not allow_length_mismatch:
+            raise LabelOverrideMismatch(
+                correction.subject, len(ordered_old), len(new_seq),
+            )
+        log.warning(
+            "Length mismatch for %s: centroid has %d vertebrae, override has %d "
+            "— pairing from cranial end (legacy min-len behaviour)",
             correction.subject, len(ordered_old), len(new_seq),
         )
 
@@ -229,10 +273,15 @@ def build_remap(
     correction: Correction,
     mask_labels: set[int],
     centroid: CentroidFile,
+    *,
+    allow_length_mismatch: bool = False,
 ) -> dict[int, int]:
     """Dispatch to the right remap-builder for this correction type."""
     if correction.label_override is not None:
-        return _label_override_remap(correction, centroid)
+        return _label_override_remap(
+            correction, centroid,
+            allow_length_mismatch=allow_length_mismatch,
+        )
     if correction.has_t13:
         return _t13_shift_remap(mask_labels)
     if correction.has_t11:
@@ -298,6 +347,8 @@ def correct_subject(
     subj_in: Path,
     subj_out: Path,
     correction: Correction | None,
+    *,
+    allow_length_mismatch: bool = False,
 ) -> CorrectionRecord:
     """Apply corrections (if any) to one subject; otherwise pass through.
 
@@ -347,7 +398,23 @@ def correct_subject(
     mask_labels = {int(v) for v in np.unique(mask_data).tolist() if v != 0}
 
     centroid = parse_centroid_json(ctd)
-    remap = build_remap(correction, mask_labels, centroid)
+    try:
+        remap = build_remap(
+            correction, mask_labels, centroid,
+            allow_length_mismatch=allow_length_mismatch,
+        )
+    except LabelOverrideMismatch as e:
+        log.error("Skipping %s: %s", correction.subject, e)
+        _passthrough()
+        return CorrectionRecord(
+            subject=subject,
+            veridah_corrected=False,
+            correction_type=correction.correction_type,
+            tltv=correction.tltv,
+            sr_left=correction.sr_left,
+            sr_right=correction.sr_right,
+            error=f"length_mismatch:centroid={e.n_centroid},override={e.n_override}",
+        )
 
     if not remap:
         # No actual remap to apply (e.g. override list matched original).
@@ -427,6 +494,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CSV,
         help=f"Path to corrections CSV (default: {DEFAULT_CSV}).",
     )
+    p.add_argument(
+        "--allow_length_mismatch",
+        action="store_true",
+        help=(
+            "Fall back to legacy min(len) pairing for LabelOverride rows whose "
+            "centroid count differs from the override length.  Default: refuse "
+            "to apply, log error, pass through uncorrected."
+        ),
+    )
     p.add_argument("--log_level", default="INFO")
     return p
 
@@ -450,7 +526,10 @@ def main(argv: list[str] | None = None) -> int:
     for d in subdirs:
         subject = d.name.removeprefix("sub-")
         correction = corrections.get(subject)
-        rec = correct_subject(d, args.out_dir / d.name, correction)
+        rec = correct_subject(
+            d, args.out_dir / d.name, correction,
+            allow_length_mismatch=args.allow_length_mismatch,
+        )
         records.append(rec)
         if rec.veridah_corrected:
             n_corrected += 1
