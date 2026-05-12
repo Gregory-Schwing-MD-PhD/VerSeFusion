@@ -4,13 +4,26 @@ qc.py — Per-scan alignment audit for VerSeFusion's unified corpus.
 ARCHITECTURE
 ------------
 Patient-level identity is already certain after unify (every scan-dir knows its
-demographics-driven patient_id).  This module's job is to verify that the
+demographics-driven patient_id).  This module's only job is to verify that the
 CT, mask, and centroid files that unify grouped together actually agree
 geometrically — same world coordinate frame, same voxel grid, mask labels
 falling inside the CT volume, centroids landing on the right mask labels.
 
 ALL CHECKS ARE PER-SCAN AND LOCAL.  We never compare one scan against another.
 This is a pure auditability stage, not a correction stage.
+
+Centroid coordinate system
+--------------------------
+After empirical verification across all 374 scans of the unified corpus,
+TUM ships centroids as direct (X, Y, Z) array indices in the image's own
+voxel grid, in BOTH the MICCAI-challenge and BIDS distributions.  Some
+BIDS files carry an explicit ``direction`` field (e.g. ``["L", "A", "S"]``)
+documenting the anatomical orientation of the axes — but that affects only
+interpretation, not indexing.  X/Y/Z map directly to image array axes 0/1/2.
+
+(The earlier "asl_iso_1mm" coordinate-system flag in unify's meta.json was
+based on a misread of TUM's documentation; centroids are always in
+image-voxel space.)
 
 Checks performed
 ----------------
@@ -26,11 +39,10 @@ Tier 2 — Mask data (loads mask voxels, not CT):
   7. labels_nonempty   — every label has at least MIN_LABEL_VOXELS
 
 Tier 3 — Centroid-mask alignment (if centroid present):
-  8. centroid_alignment — for each centroid (label, x, y, z):
-                          - converts ASL-iso → voxel space using CT affine
-                            (or uses voxel coords directly for BIDS centroids)
-                          - rounds to nearest int
-                          - checks mask[voxel] == label
+  8. centroid_alignment — for each centroid (label, X, Y, Z):
+                          - rounds (X, Y, Z) to nearest int → (i, j, k)
+                          - checks (i, j, k) is in mask bounds
+                          - checks mask[i, j, k] == label
 
 Each check produces:
   status:  one of CheckStatus.PASS / WARN / FAIL / SKIP
@@ -79,8 +91,7 @@ STATUS_RANK = {
     CheckStatus.FAIL: 3,
 }
 
-# Tolerances inspired by your series_assigner.py: direction is unit-vector dot
-# product, spacing is mm difference.
+# Affine-match tolerances (inherited from series_assigner.py).
 DIR_TOLERANCE = 1e-3
 SPC_TOLERANCE = 0.01     # mm
 
@@ -91,17 +102,6 @@ VERSE_LABEL_RANGE = (1, 28)
 # Labels with fewer than this many voxels are flagged as suspicious — most
 # likely annotation artifacts or single-slice noise.
 MIN_LABEL_VOXELS = 50
-
-# ASL → RAS rotation matrix.  ASL axes are (Anterior, Superior, Left), RAS
-# axes are (Right, Anterior, Superior).  So:
-#     RAS.x = -ASL.z  (right = -left)
-#     RAS.y =  ASL.x  (anterior = anterior)
-#     RAS.z =  ASL.y  (superior = superior)
-ASL_TO_RAS = np.array([
-    [ 0.0,  0.0, -1.0],
-    [ 1.0,  0.0,  0.0],
-    [ 0.0,  1.0,  0.0],
-])
 
 
 # =============================================================================
@@ -125,12 +125,11 @@ class CheckResult:
 @dataclass
 class ScanReport:
     """Per-scan QC summary."""
-    series_id:             str
-    patient_id:            str
-    source_format:         str
-    centroid_coord_system: str
-    overall:               str = CheckStatus.PASS
-    checks:                dict[str, CheckResult] = field(default_factory=dict)
+    series_id:     str
+    patient_id:    str
+    source_format: str
+    overall:       str = CheckStatus.PASS
+    checks:        dict[str, CheckResult] = field(default_factory=dict)
 
     def aggregate_overall(self) -> None:
         worst = CheckStatus.PASS
@@ -141,12 +140,11 @@ class ScanReport:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "series_id":             self.series_id,
-            "patient_id":            self.patient_id,
-            "source_format":         self.source_format,
-            "centroid_coord_system": self.centroid_coord_system,
-            "overall":               self.overall,
-            "checks":                {k: v.to_dict() for k, v in self.checks.items()},
+            "series_id":     self.series_id,
+            "patient_id":    self.patient_id,
+            "source_format": self.source_format,
+            "overall":       self.overall,
+            "checks":        {k: v.to_dict() for k, v in self.checks.items()},
         }
 
 
@@ -265,13 +263,10 @@ def check_affine_match(info: dict) -> CheckResult:
         reasons.append(f"spacing differs by {spc_diff:.4f}mm > {SPC_TOLERANCE}mm "
                        f"(CT={ct_spc.tolist()}, mask={mk_spc.tolist()})")
 
-    # Origins should also agree.  Allow a 0.5mm tolerance — they sometimes
-    # disagree by a fraction due to rounding in TUM's resampling pipeline.
     origin_diff = np.abs(ct_aff[:3, 3] - mk_aff[:3, 3]).max()
     if origin_diff < 0.5:
         reasons.append(f"origins agree (diff={origin_diff:.4f}mm)")
     elif origin_diff < 5.0:
-        ok = ok  # don't downgrade to FAIL on a small origin shift
         reasons.append(f"WARN: origins differ by {origin_diff:.4f}mm "
                        f"(under 5mm — likely acceptable rounding)")
     else:
@@ -328,21 +323,18 @@ def check_label_inventory(info: dict) -> CheckResult:
     return CheckResult(status=CheckStatus.PASS, reasons=reasons, extra=extra)
 
 
-def _asl_iso_centroid_to_voxel(asl_xyz: np.ndarray, ct_affine: np.ndarray) -> np.ndarray:
-    """Convert a centroid from MICCAI's 1mm-iso ASL frame to CT voxel coords.
-
-    Pipeline:
-      ASL (mm) → RAS (mm) via ASL_TO_RAS rotation
-      RAS (mm) → voxel via inv(ct_affine).
-    """
-    ras_mm = ASL_TO_RAS @ asl_xyz
-    homog = np.r_[ras_mm, 1.0]
-    voxel = np.linalg.inv(ct_affine) @ homog
-    return voxel[:3]
-
-
 def check_centroid_alignment(meta: dict[str, Any], info: dict) -> CheckResult:
-    """For each labeled centroid, verify the corresponding mask voxel has the same label."""
+    """For each labeled centroid, verify mask[i, j, k] == label.
+
+    TUM ships centroid (X, Y, Z) as direct array indices in the image's own
+    voxel grid, across both MICCAI and BIDS distributions.  We round to the
+    nearest integer, bounds-check, and look up the mask label at that voxel.
+
+    Some files carry a ``direction`` field as the first JSON entry
+    (e.g. {"direction": ["L", "A", "S"]}).  This documents the anatomical
+    orientation of the axes but doesn't affect indexing.  We record it for
+    audit but otherwise pass through.
+    """
     ctd_path = meta.get("source_paths", {}).get("ctd")
     if not ctd_path or not Path(ctd_path).exists():
         return CheckResult(status=CheckStatus.SKIP,
@@ -353,9 +345,6 @@ def check_centroid_alignment(meta: dict[str, Any], info: dict) -> CheckResult:
         return CheckResult(status=CheckStatus.SKIP,
                            reasons=["mask data not loaded — alignment check skipped"])
 
-    ct_affine = info.get("ct_affine")
-    coord_system = meta.get("centroid_coord_system", "asl_iso_1mm")
-
     try:
         with open(ctd_path) as f:
             centroids_raw = json.load(f)
@@ -363,17 +352,22 @@ def check_centroid_alignment(meta: dict[str, Any], info: dict) -> CheckResult:
         return CheckResult(status=CheckStatus.FAIL,
                            reasons=[f"failed to parse centroid JSON: {type(e).__name__}: {e}"])
 
-    # VerSe centroid JSON: list of dicts; first entry often has "direction" metadata,
-    # then per-vertebra entries {"label": int, "X": float, "Y": float, "Z": float}.
+    # The JSON is a list whose first entry may be a {"direction": [...]} header
+    # and the rest are per-vertebra centroids {"label": int, "X","Y","Z": float}.
+    direction = None
     centroid_entries = []
     for entry in centroids_raw if isinstance(centroids_raw, list) else []:
-        if isinstance(entry, dict) and all(k in entry for k in ("label", "X", "Y", "Z")):
+        if not isinstance(entry, dict):
+            continue
+        if "direction" in entry and direction is None:
+            direction = entry["direction"]
+            continue
+        if all(k in entry for k in ("label", "X", "Y", "Z")):
             centroid_entries.append(entry)
 
     if not centroid_entries:
         return CheckResult(status=CheckStatus.WARN,
-                           reasons=[f"centroid JSON has no label/X/Y/Z entries "
-                                    f"(parsed {len(centroids_raw) if isinstance(centroids_raw, list) else 0} top-level items)"])
+                           reasons=[f"centroid JSON has no label/X/Y/Z entries"])
 
     shape = msk_data.shape
     matched = 0
@@ -383,20 +377,10 @@ def check_centroid_alignment(meta: dict[str, Any], info: dict) -> CheckResult:
 
     for entry in centroid_entries:
         label = int(entry["label"])
-        xyz = np.array([float(entry["X"]), float(entry["Y"]), float(entry["Z"])])
+        i = int(round(float(entry["X"])))
+        j = int(round(float(entry["Y"])))
+        k = int(round(float(entry["Z"])))
 
-        if coord_system == "voxel":
-            voxel = xyz
-        elif coord_system == "asl_iso_1mm":
-            if ct_affine is None:
-                return CheckResult(status=CheckStatus.SKIP,
-                                   reasons=["no CT affine — cannot convert ASL centroid"])
-            voxel = _asl_iso_centroid_to_voxel(xyz, ct_affine)
-        else:
-            return CheckResult(status=CheckStatus.SKIP,
-                               reasons=[f"unknown centroid coord system: {coord_system!r}"])
-
-        i, j, k = (int(round(v)) for v in voxel)
         in_bounds = (0 <= i < shape[0] and 0 <= j < shape[1] and 0 <= k < shape[2])
         if not in_bounds:
             out_of_bounds.append({"label": label, "voxel": [i, j, k]})
@@ -406,7 +390,6 @@ def check_centroid_alignment(meta: dict[str, Any], info: dict) -> CheckResult:
         if mask_at_voxel == label:
             matched += 1
         elif mask_at_voxel == 0:
-            # voxel landed in background — annotation imprecision but not catastrophic
             label_mismatch.append({"label": label, "voxel": [i, j, k],
                                    "got": "background"})
         else:
@@ -422,12 +405,13 @@ def check_centroid_alignment(meta: dict[str, Any], info: dict) -> CheckResult:
         f"{matched}/{n} centroids land on the correct mask label "
         f"(match rate {100*match_rate:.1f}%)",
     ]
-    extra = {
-        "n_centroids":  n,
-        "n_matched":    matched,
-        "match_rate":   round(match_rate, 4),
-        "coord_system": coord_system,
+    extra: dict[str, Any] = {
+        "n_centroids": n,
+        "n_matched":   matched,
+        "match_rate":  round(match_rate, 4),
     }
+    if direction is not None:
+        extra["direction"] = direction
     if out_of_bounds:
         reasons.append(f"{len(out_of_bounds)} centroids fall outside mask bounds: "
                        f"{out_of_bounds[:5]}{'...' if len(out_of_bounds) > 5 else ''}")
@@ -467,11 +451,7 @@ def audit_scan(scan_dir_str: str) -> dict[str, Any]:
     meta_path = scan_dir / f"scan-{series_id}_meta.json"
 
     if not meta_path.exists():
-        # Build a minimal failing report
-        rep = ScanReport(
-            series_id=series_id, patient_id="?",
-            source_format="?", centroid_coord_system="?",
-        )
+        rep = ScanReport(series_id=series_id, patient_id="?", source_format="?")
         rep.checks["files_present"] = CheckResult(
             status=CheckStatus.FAIL,
             reasons=[f"no meta.json at {meta_path}"]
@@ -484,10 +464,8 @@ def audit_scan(scan_dir_str: str) -> dict[str, Any]:
         series_id=meta["series_id"],
         patient_id=meta["patient_id"],
         source_format=meta.get("source_format", "miccai"),
-        centroid_coord_system=meta.get("centroid_coord_system", "asl_iso_1mm"),
     )
 
-    # Tier 1: files present
     rep.checks["files_present"] = check_files_present(meta)
     if rep.checks["files_present"].status == CheckStatus.FAIL:
         rep.aggregate_overall()
@@ -500,24 +478,17 @@ def audit_scan(scan_dir_str: str) -> dict[str, Any]:
         rep.aggregate_overall()
         return rep.to_dict()
 
-    # Tier 1 continued: read headers
     result, info = check_headers_readable(ct_path, msk_path)
     rep.checks["headers_readable"] = result
     if result.status == CheckStatus.FAIL:
         rep.aggregate_overall()
         return rep.to_dict()
 
-    rep.checks["shape_match"]   = check_shape_match(info)
-    rep.checks["affine_match"]  = check_affine_match(info)
-
-    # Tier 2: mask data
+    rep.checks["shape_match"]    = check_shape_match(info)
+    rep.checks["affine_match"]   = check_affine_match(info)
     rep.checks["label_inventory"] = check_label_inventory(info)
-
-    # Tier 3: centroid–mask alignment
     rep.checks["centroid_alignment"] = check_centroid_alignment(meta, info)
 
-    # Drop the in-memory numpy arrays before returning (not JSON-serialisable
-    # and already used for all checks).
     info.pop("msk_data", None)
     info.pop("msk_img", None)
     info.pop("ct_affine", None)
@@ -530,6 +501,14 @@ def audit_scan(scan_dir_str: str) -> dict[str, Any]:
 # =============================================================================
 # orchestration
 # =============================================================================
+
+def _flush_logs() -> None:
+    for h in log.handlers or logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+
 
 def run_qc(unified_dir: Path, workers: int = 8) -> dict[str, Any]:
     """Run audit_scan over every scan-* subdir of unified_dir, parallelised."""
@@ -559,21 +538,16 @@ def run_qc(unified_dir: Path, workers: int = 8) -> dict[str, Any]:
                 log.info("progress: %d/%d (%.1f%%)  %.1f scans/s  ETA %ds",
                          completed, len(scan_dirs), 100 * completed / len(scan_dirs),
                          rate, int(eta))
-                for h in log.handlers or logging.getLogger().handlers:
-                    try:
-                        h.flush()
-                    except Exception:
-                        pass
+                _flush_logs()
                 last_log_count = completed
                 last_log_time = time.monotonic()
 
-    # Sort reports by series_id for deterministic output
     reports.sort(key=lambda r: r["series_id"])
 
-    # Aggregate summary
-    by_status      = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
-    by_check       : dict[str, dict[str, int]] = {}
-    flagged_scans  : dict[str, list[dict]] = {"WARN": [], "FAIL": []}
+    # Summary
+    by_status:    dict[str, int]              = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
+    by_check:     dict[str, dict[str, int]]   = {}
+    flagged:      dict[str, list[dict]]       = {"WARN": [], "FAIL": []}
 
     for r in reports:
         by_status[r["overall"]] = by_status.get(r["overall"], 0) + 1
@@ -581,8 +555,8 @@ def run_qc(unified_dir: Path, workers: int = 8) -> dict[str, Any]:
             by_check.setdefault(cname, {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0})
             by_check[cname][c["status"]] = by_check[cname].get(c["status"], 0) + 1
         if r["overall"] in ("WARN", "FAIL"):
-            flagged_scans[r["overall"]].append({
-                "series_id": r["series_id"],
+            flagged[r["overall"]].append({
+                "series_id":  r["series_id"],
                 "patient_id": r["patient_id"],
                 "failing_checks": sorted(
                     cname for cname, c in r["checks"].items()
@@ -590,12 +564,12 @@ def run_qc(unified_dir: Path, workers: int = 8) -> dict[str, Any]:
                 ),
             })
 
-    manifest = {
-        "version":         "0.1.0",
+    return {
+        "version":         "0.2.0",
         "n_scans_audited": len(reports),
         "by_status":       by_status,
         "by_check":        by_check,
-        "flagged_scans":   flagged_scans,
+        "flagged_scans":   flagged,
         "tolerances": {
             "direction_dot_product": DIR_TOLERANCE,
             "spacing_mm":            SPC_TOLERANCE,
@@ -603,7 +577,6 @@ def run_qc(unified_dir: Path, workers: int = 8) -> dict[str, Any]:
         },
         "scans":           reports,
     }
-    return manifest
 
 
 # =============================================================================
