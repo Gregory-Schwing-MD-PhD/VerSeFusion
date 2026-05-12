@@ -3,21 +3,19 @@
 #SBATCH -q primary
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=08:00:00
 #SBATCH --output=logs/verse-download-%j.out
 #SBATCH --error=logs/verse-download-%j.err
 #SBATCH --mail-type=END,FAIL
 
-# Pull the six VerSe S3 zips on Warrior HPC.
-# 30 GB total; 8h is generous and accounts for spotty S3 throughput.
+# Download VerSe in MICCAI-challenge format from OSF nodes:
+#   VerSe19: https://osf.io/923ap/
+#   VerSe20: https://osf.io/b2wxj/
+# Throttled and resumable.  Expect ~1500-1600 files total across both releases.
 
 set -euo pipefail
-
-# SLURM copies the script body to a temp dir, so $0 / $(dirname $0) point
-# nowhere useful.  Anchor on SLURM_SUBMIT_DIR (always set by sbatch) so
-# _common.sh resolves to the real repo path.
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 . slurm/_common.sh
 
@@ -25,6 +23,4 @@ singularity exec \
     --bind "${REPO_ROOT}:${REPO_ROOT}" \
     --bind "${DATA_DIR}:${DATA_DIR}" \
     "${CONTAINER_SIF}" \
-    python -m verse_pipeline.download \
-        --out_dir "${RAW_DIR}" \
-        --log_level INFO
+    python -m verse_pipeline.download --out_dir "${RAW_DIR}"
