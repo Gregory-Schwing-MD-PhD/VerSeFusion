@@ -352,25 +352,45 @@ class DownloadReport:
 
 def discover_and_plan(demographics_path: Path, use_bids_fallback: bool,
                       releases: list[str]) -> tuple[list[OSFEntry], set[str], set[str]]:
-    """Phase 1+2: list MICCAI, compute gap vs demographics, list BIDS fallback if needed.
+    """Phase 1+2: list MICCAI, compute per-kind completeness gap, list BIDS fallback.
+
+    Trigger BIDS fallback for any subject missing one or more REQUIRED kinds
+    in MICCAI — not just subjects missing entirely.  MICCAI sometimes ships
+    partial coverage (e.g. CT + mask but no centroid) which used to fall
+    through the previous "zero coverage" check.
+
+    For each subject with missing kinds, we walk the BIDS nodes and harvest
+    ONLY files matching the missing kinds, so MICCAI's good files take
+    precedence (and we don't double-download).
 
     Returns:
-        all_files: combined list of all OSFEntries to fetch (MICCAI + BIDS fallback)
-        miccai_ids: set of series_ids discovered in MICCAI listings
-        recovered_ids: set of series_ids covered by BIDS fallback
+        all_files: every OSFEntry to fetch (MICCAI + BIDS supplements)
+        miccai_ids: set of series_ids with ≥1 file in MICCAI (for logging)
+        recovered_ids: set of series_ids that got ≥1 file from BIDS fallback
     """
+    from collections import defaultdict
+
     all_files: list[OSFEntry] = []
     miccai_ids: set[str] = set()
     recovered_ids: set[str] = set()
+
+    # The kinds required for a subject to be considered "complete".
+    REQUIRED_KINDS = {"ct", "msk", "ctd"}
 
     rows = load_demographics(demographics_path)
     expected_ids = {r.series_id for r in rows}
     log.info("Demographics: %d expected series_ids", len(expected_ids))
 
+    # Track which kinds are present in MICCAI for each series_id, per release.
+    # We key by series_id alone (not release) because the per-release split is
+    # handled later by unify; what matters here is "is any release shipping
+    # this kind for this subject from MICCAI?"
+    miccai_kinds: dict[str, set[str]] = defaultdict(set)
+
     with requests.Session() as session:
         session.headers.update({"User-Agent": USER_AGENT})
 
-        # --- MICCAI primary listings ---
+        # --- Phase 1: list MICCAI primary nodes ---
         for release in releases:
             node_id = MICCAI_RELEASES[release]
             log.info("=" * 70)
@@ -378,52 +398,101 @@ def discover_and_plan(demographics_path: Path, use_bids_fallback: bool,
             files = list_storage_recursive(release, node_id, session)
             for f in files:
                 f.source = "miccai"
+                parsed = parse_miccai_filename(f.name)
+                if parsed:
+                    sid, kind = parsed
+                    miccai_ids.add(sid)
+                    miccai_kinds[sid].add(kind)
             all_files.extend(files)
-            miccai_ids |= series_ids_from_listing(files, source="miccai")
 
-        log.info("MICCAI listings cover %d/%d expected series_ids",
-                 len(miccai_ids & expected_ids), len(expected_ids))
+        # --- Phase 2: compute per-subject missing-kinds map ---
+        # subject_gaps[sid] is the set of REQUIRED kinds missing for this
+        # subject across all MICCAI releases.
+        subject_gaps: dict[str, set[str]] = {}
+        for sid in expected_ids:
+            present = miccai_kinds.get(sid, set()) & REQUIRED_KINDS
+            missing = REQUIRED_KINDS - present
+            if missing:
+                subject_gaps[sid] = missing
 
-        missing = expected_ids - miccai_ids
-        if not missing:
-            log.info("No subjects missing from MICCAI; BIDS fallback unnecessary.")
+        n_complete    = len(expected_ids) - len(subject_gaps)
+        n_partial     = sum(1 for ks in subject_gaps.values() if ks != REQUIRED_KINDS)
+        n_zero        = sum(1 for ks in subject_gaps.values() if ks == REQUIRED_KINDS)
+        log.info("MICCAI completeness: %d/%d subjects have all required kinds",
+                 n_complete, len(expected_ids))
+        log.info("  %d subjects partially covered (some kinds present, some missing)",
+                 n_partial)
+        log.info("  %d subjects with zero MICCAI files", n_zero)
+
+        if not subject_gaps:
+            log.info("No subjects need BIDS fallback.")
             return all_files, miccai_ids, recovered_ids
 
-        log.info("%d series_ids missing from MICCAI: %s",
-                 len(missing), sorted(missing))
+        # Show specifics for partial-coverage cases (helps debugging).
+        partial_examples = sorted([sid for sid, ks in subject_gaps.items()
+                                   if ks != REQUIRED_KINDS])[:15]
+        if partial_examples:
+            log.info("Partial-coverage subjects (first 15): %s",
+                     [(sid, sorted(subject_gaps[sid])) for sid in partial_examples])
 
         if not use_bids_fallback:
-            log.info("BIDS fallback disabled by --no_bids_fallback; missing "
-                     "subjects will not be recovered.")
+            log.info("BIDS fallback disabled by --no_bids_fallback; "
+                     "incomplete subjects will not be filled in.")
             return all_files, miccai_ids, recovered_ids
 
-        # --- BIDS fallback listings, filtered to missing subjects only ---
+        # --- Phase 3: BIDS fallback, filtered per-subject AND per-kind ---
         log.info("=" * 70)
-        log.info("BIDS fallback ENABLED — listing BIDS nodes for the %d missing series…",
-                 len(missing))
+        log.info("BIDS fallback ENABLED — listing BIDS nodes for the %d "
+                 "incomplete subjects…", len(subject_gaps))
+        recovered_kinds: dict[str, set[str]] = defaultdict(set)
         for release in releases:
             bids_node = BIDS_RELEASES[release]
             log.info("Listing BIDS %s (node %s)…", release, bids_node)
             files = list_storage_recursive(release, bids_node, session)
 
-            relevant = []
+            relevant: list[OSFEntry] = []
             for f in files:
                 sid = _bids_series_id(f.name)
-                if sid in missing:
-                    f.source = "bids_fallback"
-                    relevant.append(f)
-                    recovered_ids.add(sid)
-            log.info("  [%s/BIDS] retained %d files for %d missing series",
+                if sid not in subject_gaps:
+                    continue
+                parsed = parse_miccai_filename(f.name)
+                if parsed is None:
+                    continue
+                _, kind = parsed
+                # Only take BIDS files for kinds the subject actually needs;
+                # if MICCAI already has the CT, we don't want BIDS's CT too.
+                if kind not in subject_gaps[sid]:
+                    continue
+                # And only the first BIDS hit per (sid, kind) — BIDS can have
+                # several with different entities (dir-iso vs dir-sag etc.).
+                if kind in recovered_kinds[sid]:
+                    continue
+                f.source = "bids_fallback"
+                relevant.append(f)
+                recovered_kinds[sid].add(kind)
+                recovered_ids.add(sid)
+            log.info("  [%s/BIDS] retained %d files for %d subjects (per-kind filtered)",
                      release, len(relevant),
                      len({_bids_series_id(f.name) for f in relevant}))
             all_files.extend(relevant)
 
-        still_missing = missing - recovered_ids
+        # Report what we recovered vs still missing.
+        still_missing = {sid: gaps - recovered_kinds.get(sid, set())
+                         for sid, gaps in subject_gaps.items()}
+        still_missing = {sid: ks for sid, ks in still_missing.items() if ks}
+        n_fully_recovered = sum(
+            1 for sid, gaps in subject_gaps.items()
+            if not (gaps - recovered_kinds.get(sid, set()))
+        )
+
+        log.info("BIDS fallback summary:")
+        log.info("  fully recovered: %d/%d subjects", n_fully_recovered, len(subject_gaps))
+        log.info("  files added:     %d", sum(len(v) for v in recovered_kinds.values()))
         if still_missing:
-            log.warning("After BIDS fallback, %d series still uncovered: %s",
-                        len(still_missing), sorted(still_missing))
-        else:
-            log.info("BIDS fallback recovered all %d missing series.", len(missing))
+            log.warning("  %d subjects STILL missing kinds after fallback:",
+                        len(still_missing))
+            for sid in sorted(still_missing):
+                log.warning("    %s: missing %s", sid, sorted(still_missing[sid]))
 
     return all_files, miccai_ids, recovered_ids
 

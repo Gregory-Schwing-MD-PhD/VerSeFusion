@@ -48,6 +48,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,6 +71,20 @@ SPLIT_PATTERNS: tuple[tuple[str, str], ...] = (
     ("valid", "validation"),
     ("test",  "test"),
 )
+
+# How often to emit progress logs during the long-running phases.
+DISCOVER_PROGRESS_EVERY_N_FILES = 500
+MATERIALISE_PROGRESS_EVERY_N_SCANS = 25
+PROGRESS_TIME_INTERVAL_SECONDS = 10.0
+
+
+def _flush_logs() -> None:
+    """Force-flush all log handlers so SLURM .err files show output promptly."""
+    for h in log.handlers or logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -104,14 +119,14 @@ def _split_for_path(path: Path) -> str:
 def discover_raw(raw_root: Path) -> dict[tuple[str, str], RawScan]:
     """Walk raw_root recursively, grouping MICCAI files by (release, series_id).
 
-    Returns {(release, series_id): RawScan}.
+    Logs progress every DISCOVER_PROGRESS_EVERY_N_FILES files or every
+    PROGRESS_TIME_INTERVAL_SECONDS seconds, whichever comes first.
     """
     out: dict[tuple[str, str], RawScan] = {}
     if not raw_root.is_dir():
         log.error("Raw dir not found: %s", raw_root)
         return out
 
-    # Each immediate child of raw_root is a release folder (verse19, verse20).
     for release_dir in sorted(raw_root.iterdir()):
         if not release_dir.is_dir():
             continue
@@ -120,33 +135,57 @@ def discover_raw(raw_root: Path) -> dict[tuple[str, str], RawScan]:
             log.debug("Skipping unknown release dir: %s", release_dir)
             continue
 
+        log.info("Walking release %s at %s …", release, release_dir)
+        _flush_logs()
+
         n_files_seen = 0
-        for path in sorted(release_dir.rglob("*")):
+        n_parsed = 0
+        last_log_count = 0
+        last_log_time = time.monotonic()
+        start = last_log_time
+
+        # rglob can be slow on cold-cache distributed FS; that's why we log
+        # eagerly during the walk rather than at the end.
+        for path in release_dir.rglob("*"):
             if not path.is_file():
                 continue
             n_files_seen += 1
             parsed = parse_path(path)
-            if parsed is None:
-                continue   # README, license, unrelated files
-            key = (release, parsed.series_id)
-            if key not in out:
-                out[key] = RawScan(
-                    release=release,
-                    series_id=parsed.series_id,
-                    split=_split_for_path(path),
-                )
-            # If we see the same kind twice for the same scan, keep the first
-            # and warn — could happen if OSF reorganization left duplicates.
-            if parsed.kind in out[key].files:
-                log.warning("Duplicate %s for %s/%s: keeping %s, ignoring %s",
-                            parsed.kind, release, parsed.series_id,
-                            out[key].files[parsed.kind].path, path)
-                continue
-            out[key].files[parsed.kind] = parsed
+            if parsed is not None:
+                n_parsed += 1
+                key = (release, parsed.series_id)
+                if key not in out:
+                    out[key] = RawScan(
+                        release=release,
+                        series_id=parsed.series_id,
+                        split=_split_for_path(path),
+                    )
+                # Keep first occurrence of each kind, warn on dupes.
+                if parsed.kind in out[key].files:
+                    log.warning("Duplicate %s for %s/%s: keeping %s, ignoring %s",
+                                parsed.kind, release, parsed.series_id,
+                                out[key].files[parsed.kind].path, path)
+                else:
+                    out[key].files[parsed.kind] = parsed
 
-        log.info("Release %s: scanned %d files, %d scans found",
-                 release, n_files_seen,
-                 sum(1 for (r, _) in out if r == release))
+            # Periodic progress log
+            since_count = n_files_seen - last_log_count
+            since_time = time.monotonic() - last_log_time
+            if (since_count >= DISCOVER_PROGRESS_EVERY_N_FILES
+                    or since_time >= PROGRESS_TIME_INTERVAL_SECONDS):
+                n_scans_so_far = sum(1 for (r, _) in out if r == release)
+                rate = n_files_seen / (time.monotonic() - start) if (time.monotonic() - start) > 0 else 0.0
+                log.info("  [%s] %d files seen, %d parsed, %d scans grouped (%.0f files/s)",
+                         release, n_files_seen, n_parsed, n_scans_so_far, rate)
+                _flush_logs()
+                last_log_count = n_files_seen
+                last_log_time = time.monotonic()
+
+        n_scans = sum(1 for (r, _) in out if r == release)
+        log.info("Release %s done: %d files scanned, %d MICCAI-recognised, %d scans grouped",
+                 release, n_files_seen, n_parsed, n_scans)
+        _flush_logs()
+
     return out
 
 
@@ -157,19 +196,37 @@ def discover_raw(raw_root: Path) -> dict[tuple[str, str], RawScan]:
 @dataclass
 class UnifiedScan:
     """One canonical scan directory output."""
-    series_id:       str
-    patient_id:      str
-    chosen_release:  str
-    other_releases:  list[str]
-    split:           str
-    position:        str
-    sex:             str
-    age:             int | None
-    in_v19:          bool
-    in_v20:          bool
-    source_paths:    dict[str, str]                # kind -> source filesystem path
-    missing_kinds:   list[str]
-    out_dir:         Path
+    series_id:              str
+    patient_id:             str
+    chosen_release:         str
+    other_releases:         list[str]
+    split:                  str
+    position:               str
+    sex:                    str
+    age:                    int | None
+    in_v19:                 bool
+    in_v20:                 bool
+    source_paths:           dict[str, str]                # kind -> source filesystem path
+    missing_kinds:          list[str]
+    out_dir:                Path
+    source_format:          str                           # "miccai" | "bids"
+    centroid_coord_system:  str                           # "asl_iso_1mm" | "voxel"
+
+
+def _detect_source_format(source_paths: dict[str, str]) -> tuple[str, str]:
+    """Inspect the source filenames to determine format + centroid coord system.
+
+    Returns ``(source_format, centroid_coord_system)`` where:
+      - ``source_format`` is ``"bids"`` if any source filename starts with
+        ``sub-`` or contains the BIDS ``_dir-`` entity, else ``"miccai"``.
+      - ``centroid_coord_system`` is ``"voxel"`` for BIDS (per-image voxel
+        space) or ``"asl_iso_1mm"`` for MICCAI (uniform 1mm isotropic ASL).
+    """
+    for path in source_paths.values():
+        name = Path(path).name
+        if name.startswith("sub-") or "_dir-" in name:
+            return "bids", "voxel"
+    return "miccai", "asl_iso_1mm"
 
 
 def _choose_release(
@@ -211,35 +268,47 @@ def materialise_scan(
     others_releases: list[str],
     out_root: Path,
 ) -> UnifiedScan:
-    """Create out_root/scan-<series_id>/ with symlinks + meta.json."""
+    """Create out_root/scan-<series_id>/ with symlinks + meta.json.
+
+    Uses .absolute() (no FS access) instead of .resolve() (which does a stat
+    on every path component and is slow on distributed filesystems).
+    """
     scan_dir = out_root / f"scan-{raw.series_id}"
     scan_dir.mkdir(parents=True, exist_ok=True)
 
+    ext_map = {"ct":  "ct.nii.gz",  "msk": "msk.nii.gz",
+               "ctd": "ctd.json",   "snp": "snp.png"}
+
     source_paths: dict[str, str] = {}
     for kind, src in raw.files.items():
-        ext_map = {"ct": "ct.nii.gz", "msk": "msk.nii.gz",
-                   "ctd": "ctd.json",  "snp": "snp.png"}
         dst_name = f"scan-{raw.series_id}_{ext_map[kind]}"
         dst = scan_dir / dst_name
         if dst.exists() or dst.is_symlink():
             dst.unlink()
-        dst.symlink_to(src.path.resolve())
-        source_paths[kind] = str(src.path.resolve())
+        # absolute() returns the canonical absolute path WITHOUT resolving
+        # symlinks or hitting the FS — much faster than resolve().
+        src_abs = src.path.absolute()
+        dst.symlink_to(src_abs)
+        source_paths[kind] = str(src_abs)
+
+    source_format, centroid_coord_system = _detect_source_format(source_paths)
 
     meta = {
-        "series_id":      raw.series_id,
-        "patient_id":     demo.patient_id,
-        "chosen_release": raw.release,
-        "other_releases": others_releases,
-        "split":          raw.split,
-        "position":       demo.position,
-        "in_v19":         demo.in_v19,
-        "in_v20":         demo.in_v20,
-        "sex":            demo.sex,
-        "age":            demo.age,
-        "source_paths":   source_paths,
-        "missing_kinds":  raw.missing_kinds(),
-        "version":        "0.1.0",
+        "series_id":             raw.series_id,
+        "patient_id":            demo.patient_id,
+        "chosen_release":        raw.release,
+        "other_releases":        others_releases,
+        "split":                 raw.split,
+        "position":              demo.position,
+        "in_v19":                demo.in_v19,
+        "in_v20":                demo.in_v20,
+        "sex":                   demo.sex,
+        "age":                   demo.age,
+        "source_paths":          source_paths,
+        "missing_kinds":         raw.missing_kinds(),
+        "source_format":         source_format,
+        "centroid_coord_system": centroid_coord_system,
+        "version":               "0.2.0",
     }
     meta_path = scan_dir / f"scan-{raw.series_id}_meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
@@ -258,6 +327,8 @@ def materialise_scan(
         source_paths=source_paths,
         missing_kinds=raw.missing_kinds(),
         out_dir=scan_dir,
+        source_format=source_format,
+        centroid_coord_system=centroid_coord_system,
     )
 
 
@@ -266,19 +337,25 @@ def unify(
     out_root: Path,
     demographics_path: Path,
 ) -> list[UnifiedScan]:
-    """Top-level unify: discover raw, walk demographics, materialise per-scan dirs."""
+    """Top-level unify: discover raw, walk demographics, materialise per-scan dirs.
+
+    Logs progress every MATERIALISE_PROGRESS_EVERY_N_SCANS scans or every
+    PROGRESS_TIME_INTERVAL_SECONDS seconds during the materialise loop.
+    """
     out_root.mkdir(parents=True, exist_ok=True)
 
     demographics = load_demographics(demographics_path)
     demo_idx = index_by_series(demographics)
     log.info("Demographics: %d series across %d patients",
              len(demographics), len({r.patient_id for r in demographics}))
+    _flush_logs()
 
     raws = discover_raw(raw_root)
     log.info("Raw discovery: %d (release, series_id) tuples across both releases",
              len(raws))
+    _flush_logs()
 
-    # Series IDs present on disk
+    # Series IDs present on disk vs. in demographics
     disk_series = {sid for (_, sid) in raws}
     demo_series = set(demo_idx)
     missing_from_disk = demo_series - disk_series
@@ -290,25 +367,49 @@ def unify(
     if extra_on_disk:
         log.warning("%d series in raw data but NOT in demographics: %s",
                     len(extra_on_disk), sorted(extra_on_disk)[:10])
+    _flush_logs()
 
-    # Build unified scans driven by the demographics list — it's the
-    # authoritative roster.  Series we have on disk but not in demographics
-    # are skipped (with the warning above); demographics rows with no disk
-    # data are recorded as missing-all-kinds.
+    # Materialise per-scan dirs in demographics order.
+    log.info("Materialising %d scan directories…", len(demographics))
+    _flush_logs()
+
     unified: list[UnifiedScan] = []
-    for demo in demographics:
+    skipped = 0
+    last_log_count = 0
+    last_log_time = time.monotonic()
+    start = last_log_time
+
+    for i, demo in enumerate(demographics, 1):
         chosen, others = _choose_release(raws, demo.series_id,
                                          demo.in_v19, demo.in_v20)
         if chosen is None:
-            log.warning("No raw files found for series %s (%s), patient %s — skipping",
-                        demo.series_id,
-                        "/".join(filter(None, ["v19" if demo.in_v19 else "",
-                                               "v20" if demo.in_v20 else ""])) or "?",
-                        demo.patient_id)
-            continue
-        raw = raws[(chosen, demo.series_id)]
-        unified.append(materialise_scan(raw, demo, others, out_root))
+            log.warning("No raw files for series %s (patient %s) — skipping",
+                        demo.series_id, demo.patient_id)
+            skipped += 1
+        else:
+            raw = raws[(chosen, demo.series_id)]
+            unified.append(materialise_scan(raw, demo, others, out_root))
 
+        # Periodic progress log
+        since_count = i - last_log_count
+        since_time = time.monotonic() - last_log_time
+        if (since_count >= MATERIALISE_PROGRESS_EVERY_N_SCANS
+                or since_time >= PROGRESS_TIME_INTERVAL_SECONDS):
+            elapsed = time.monotonic() - start
+            rate = i / elapsed if elapsed > 0 else 0.0
+            remaining = len(demographics) - i
+            eta = remaining / rate if rate > 0 else 0.0
+            log.info("  progress: %d/%d (%.1f%%)  unified=%d skipped=%d  "
+                     "%.1f scans/s  ETA %ds",
+                     i, len(demographics), 100 * i / len(demographics),
+                     len(unified), skipped, rate, int(eta))
+            _flush_logs()
+            last_log_count = i
+            last_log_time = time.monotonic()
+
+    log.info("Materialise done: %d unified, %d skipped (no raw files)",
+             len(unified), skipped)
+    _flush_logs()
     return unified
 
 
@@ -317,9 +418,10 @@ def unify(
 # =============================================================================
 
 def write_unify_manifest(unified: list[UnifiedScan], out_root: Path) -> Path:
-    by_release   = defaultdict(int)
-    by_split     = defaultdict(int)
-    by_patient   = defaultdict(list)
+    by_release        = defaultdict(int)
+    by_split          = defaultdict(int)
+    by_patient        = defaultdict(list)
+    by_source_format  = defaultdict(int)
     n_complete   = 0
     n_image_only = 0
     n_msk_only   = 0
@@ -329,6 +431,7 @@ def write_unify_manifest(unified: list[UnifiedScan], out_root: Path) -> Path:
         by_release[s.chosen_release] += 1
         by_split[s.split] += 1
         by_patient[s.patient_id].append(s.series_id)
+        by_source_format[s.source_format] += 1
         m = set(s.missing_kinds)
         if not m:
             n_complete += 1
@@ -342,14 +445,15 @@ def write_unify_manifest(unified: list[UnifiedScan], out_root: Path) -> Path:
     multi_patients = {p: scans for p, scans in by_patient.items() if len(scans) > 1}
 
     manifest = {
-        "version":              "0.2.0",
-        "source_format":        "miccai",
+        "version":              "0.3.0",
+        "source_format":        "miccai_with_bids_fallback",
         "preferred_release":    PREFERRED_RELEASE,
         "n_scans":              len(unified),
         "n_patients":           len(by_patient),
         "n_multi_series":       len(multi_patients),
         "by_release":           dict(by_release),
         "by_split":             dict(by_split),
+        "by_source_format":     dict(by_source_format),
         "completeness": {
             "n_complete":       n_complete,
             "n_image_only":     n_image_only,
@@ -359,19 +463,21 @@ def write_unify_manifest(unified: list[UnifiedScan], out_root: Path) -> Path:
         "multi_series_patients": multi_patients,
         "scans": [
             {
-                "series_id":      s.series_id,
-                "patient_id":     s.patient_id,
-                "chosen_release": s.chosen_release,
-                "other_releases": s.other_releases,
-                "split":          s.split,
-                "position":       s.position,
-                "in_v19":         s.in_v19,
-                "in_v20":         s.in_v20,
-                "sex":            s.sex,
-                "age":            s.age,
-                "missing_kinds":  s.missing_kinds,
-                "source_paths":   s.source_paths,
-                "out_dir":        str(s.out_dir),
+                "series_id":             s.series_id,
+                "patient_id":            s.patient_id,
+                "chosen_release":        s.chosen_release,
+                "other_releases":        s.other_releases,
+                "split":                 s.split,
+                "position":              s.position,
+                "in_v19":                s.in_v19,
+                "in_v20":                s.in_v20,
+                "sex":                   s.sex,
+                "age":                   s.age,
+                "missing_kinds":         s.missing_kinds,
+                "source_paths":          s.source_paths,
+                "out_dir":               str(s.out_dir),
+                "source_format":         s.source_format,
+                "centroid_coord_system": s.centroid_coord_system,
             }
             for s in unified
         ],
@@ -400,7 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out_dir", type=Path, required=True,
                    help="Where to write data/unified/scan-*.")
     p.add_argument("--demographics", type=Path, required=True,
-                   help="Path to configs/verse_demographics.xlsx.")
+                   help="Path to configs/verse_demographics.csv.")
     p.add_argument("--log_level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
