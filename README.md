@@ -1,300 +1,352 @@
-# VerSeFusion
+# VerSeFusion-LSTV
 
-A reproducible pipeline to download, unify, deduplicate, **label-correct**, and
-benchmark-export the **VerSe 2019** and **VerSe 2020** CT vertebrae
-segmentation datasets as a single curated corpus with explicit handling of
-enumeration anomalies (LSTV, T13) and a crosswalk to the
-[CTSpinoPelvic1K](https://github.com/gschwing/CTSpinoPelvic1K) label scheme.
+A reproducible pipeline that constructs a Castellvi-graded vertebrae segmentation
+corpus from the public VerSe distributions, fusing both releases (VerSe 2019 +
+VerSe 2020) into a single patient-level dataset with auditable provenance.
 
----
+This repository accompanies the NeurIPS 2026 Datasets & Benchmarks Track
+submission. **All identifiers in this repository are anonymized for the
+double-blind review process.**
 
-## What this repo gives you
+## Why this dataset
 
-Running the full pipeline produces **355 subjects** (matches the canonical
-TUM count of 374 scans from 355 patients), drawn from two upstream releases
-that ship with disjoint subject-ID ranges:
+VerSe is the canonical public CT-spine segmentation benchmark, but the
+distribution is a moving target: there are two parallel releases (2019 and
+2020), two parallel file formats (MICCAI-challenge and BIDS), and a known
+limitation that **lumbosacral transitional vertebrae (LSTV) of Castellvi
+grades 3 and 4 are not segmented by design** — TUM's annotation protocol
+excludes fused transitional vertebrae from the segmentation labels.
 
-| Source           | Subjects | Notes                                              |
-|------------------|---------:|----------------------------------------------------|
-| VerSe19          |      141 | `sub-verse{001..400}` range                        |
-| VerSe20          |      214 | `sub-verse{500..800}` + `sub-gl{001..500}` ranges  |
-| **Total unique** |  **355** | dedup'd, single canonical scan per subject         |
+VerSe-trained segmentation models therefore systematically fail on the most
+pathologically important LSTV cases, the very ones a surgeon needs to plan
+around. This pipeline:
 
-Each subject carries: a CT volume, a vertebra segmentation mask (28-class
-VerSe label scheme), and centroid coordinates in voxel space.  All three are
-reoriented to **PIR** (Posterior / Inferior / Right) to match the
-CTSpinoPelvic1K convention.
+1. Re-fuses the two VerSe releases into a single 374-scan / 355-patient corpus
+2. Resolves multi-series patients via TUM's published demographic table
+3. Recovers subjects partially or fully missing from MICCAI by falling back
+   to the BIDS distribution
+4. Audits every scan for CT/mask/centroid geometric agreement
+5. Adds Castellvi-grade LSTV annotations to enable training of LSTV-aware
+   segmentation and grading models
 
-### What's different about VerSeFusion vs. just downloading VerSe directly
+## Pretrained weights
 
-1. **OSF as the canonical source.**  The S3 endpoint cited in upstream
-   documentation (`s3.bonescreen.de`) has been offline since May 2024;
-   VerSeFusion downloads instead from OSF nodes `jtfa5` (VerSe19) and `4skx2`
-   (VerSe20), which host the same BIDS-restructured form.  See
-   [`docs/design.md`](docs/design.md).
+Pretrained nnU-Net (5-fold) checkpoints are hosted on HuggingFace because
+they exceed GitHub's storage limits. See `WEIGHTS.md` for download
+instructions.
 
-2. **VERIDAH manual label corrections applied.**  Moeller et al. (2026)
-   manually reviewed VerSe and published 25 label-correction entries (mostly
-   T13 cases where the supernumerary thoracic vertebra was annotated as L1
-   with subsequent lumbar labels shifted down).  VerSeFusion incorporates
-   these via the `correct` stage (`configs/veridah_corrections.csv`).
-   To our knowledge, this is the first publicly available distribution of
-   VerSe with VERIDAH-validated ground truth.
+## Quick start
 
-3. **PIR reorientation throughout.**  CT, mask, and centroid voxel
-   coordinates are transformed in lockstep so models trained on
-   CTSpinoPelvic1K can be evaluated on VerSeFusion without an
-   inference-time reorientation step.
+```bash
+# 1. Set up the conda environment + Singularity container
+make setup
 
-4. **Stratified 5-fold CV splits** on the LSTV/T13/normal axis so reported
-   DSC can be sliced by anomaly category at evaluation time.
+# 2. Run the full pipeline (each stage logs to logs/)
+make download-slurm     # ~25 min, ~60 GB → data/raw/
+make unify-slurm        # ~30 s, → data/unified/
+make qc-slurm           # ~5 min, → data/qc/
+```
 
-5. **HuggingFace-compatible flat export** for downstream training and
-   benchmarking.
+Each stage is independently re-runnable; outputs are deterministic.
 
-## Primary downstream uses
+## Pipeline overview
 
-- External validation of nnU-Net v2 / VERIDAH / SPINEPS / TotalSegmentator
-  models trained on CTSpinoPelvic1K.
-- Pretraining corpus for the nnU-Net v2 trainer.
-- Standalone benchmark for vertebrae labelling and segmentation with
-  LSTV-stratified evaluation.
+```
+                  configs/verse_demographics.csv
+                          │
+                          ▼
+   OSF MICCAI nodes ──┐
+   (923ap, b2wxj)     ├──► download ──► data/raw/{verse19,verse20}/
+   OSF BIDS nodes  ───┤        (auto-discover gaps, fallback to BIDS
+   (jtfa5, 4skx2)     │         for any missing CT / mask / centroid)
+                      │
+                      └──► unify ──► data/unified/scan-<series_id>/
+                                       (one canonical dir per scan,
+                                        symlinks + meta.json)
+                                          │
+                                          ▼
+                                       qc ──► data/qc/qc_manifest.json
+                                          │
+                                          ▼
+                              (Castellvi annotation +
+                               nnU-Net training — separate stages,
+                               see paper for details)
+```
+
+### Stage 1 — Download
+
+```bash
+make download-slurm
+```
+
+Auto-discovers the gap between TUM's published demographics (374 expected
+series) and what OSF's MICCAI-format nodes actually publish. For any subject
+missing one or more required kinds (CT, mask, centroid), the script falls
+back to OSF's BIDS-format mirrors and fetches only the missing files.
+
+The fallback is per-kind, not just per-subject: if MICCAI has a CT but no
+centroid for verse051, only the centroid is pulled from BIDS, MICCAI's CT
+takes precedence.
+
+Downloads are streamed in parallel (`ThreadPoolExecutor`, default 8 workers)
+against OSF's S3-backed CDN. Listing happens serially with throttling to
+respect OSF's API rate limit; downloads from the CDN aren't rate-limited.
+Resumable — files already present at the expected size are counted as
+cached on re-runs.
+
+Per-file manifest at `data/raw/download_manifest.json` records source
+(`miccai` or `bids_fallback`), remote path, local path, and size.
+
+```bash
+# Disable the BIDS fallback if you want a pure MICCAI subset:
+DOWNLOAD_FLAGS="--no_bids_fallback" sbatch slurm/download_raw.sh
+
+# Crank workers up to 16:
+DOWNLOAD_WORKERS=16 sbatch slurm/download_raw.sh
+```
+
+### Stage 2 — Unify
+
+```bash
+make unify-slurm
+```
+
+Walks `data/raw/`, parses MICCAI- and BIDS-style filenames through a single
+permissive parser (handles `verseNNN.nii.gz`, `verseNNN_CT-iso.nii.gz`,
+`sub-verseNNN_dir-iso_ct.nii.gz`, `GL003.nii.gz`, plus multi-series
+patient variants like `verse400_verse090_CT-iso.nii.gz`), groups files by
+`(release, series_id)`, and materializes one canonical directory per scan
+at `data/unified/scan-<series_id>/`:
+
+```
+data/unified/scan-verse014/
+├── scan-verse014_ct.nii.gz         (symlink to raw CT)
+├── scan-verse014_msk.nii.gz        (symlink to raw mask)
+├── scan-verse014_ctd.json          (symlink to raw centroid)
+├── scan-verse014_snp.png           (symlink to raw snapshot)
+└── scan-verse014_meta.json         (generated, see schema below)
+```
+
+When a series appears in both releases (105 cross-release subjects per TUM's
+demographics), the v20 copy is preferred but both source paths are recorded.
+
+Each scan's `meta.json` carries:
+
+```json
+{
+  "series_id":             "verse014",
+  "patient_id":            "verse014",        // sibling-scan grouping key
+  "chosen_release":        "verse19",
+  "other_releases":        ["verse20"],
+  "split":                 "training",
+  "position":              "1 of 1",
+  "in_v19":                true,
+  "in_v20":                false,
+  "sex":                   "F",
+  "age":                   72,
+  "source_paths":          {"ct": "...", "msk": "...", "ctd": "...", "snp": "..."},
+  "missing_kinds":         [],
+  "source_format":         "miccai",           // miccai | bids
+  "centroid_coord_system": "asl_iso_1mm",      // asl_iso_1mm | voxel
+  "version":               "0.2.0"
+}
+```
+
+The `source_format` and `centroid_coord_system` fields are critical for
+downstream stages: MICCAI centroids are in 1 mm isotropic ASL space, BIDS
+centroids are in per-image voxel space. The reorient stage dispatches on
+this flag.
+
+Manifest at `data/unified/unify_manifest.json` aggregates counts:
+
+```bash
+jq '{n_scans, n_patients, n_multi_series, by_release, by_split,
+     by_source_format, completeness}' data/unified/unify_manifest.json
+```
+
+### Stage 3 — QC (alignment audit)
+
+```bash
+make qc-slurm
+```
+
+Per-scan QC audits the unified corpus for geometric consistency. For each
+scan, six checks run independently:
+
+| Check                 | What it verifies                                          | Why it matters |
+|-----------------------|------------------------------------------------------------|----------------|
+| `files_present`       | CT, mask, centroid present on disk                         | catches stale symlinks |
+| `headers_readable`    | nibabel can load both NIfTI headers                        | catches truncated downloads |
+| `shape_match`         | CT and mask have identical voxel grids                     | nnU-Net assumes this |
+| `affine_match`        | CT and mask agree on direction matrix + spacing            | catches LPS/RAS mismatches |
+| `label_inventory`     | mask labels in VerSe range [1, 28], no tiny artifacts      | catches label noise |
+| `centroid_alignment`  | each centroid's `(label, x, y, z)` lands on matching mask voxel | end-to-end ground-truth integrity |
+
+Each check returns `PASS / WARN / FAIL / SKIP` with reason strings; the
+per-scan overall status is the worst-of.
+
+The centroid-alignment check is the gold standard: it converts MICCAI's
+1mm-iso-ASL centroids to voxel space using the CT's affine (or uses voxel
+coords directly for BIDS-recovered subjects), rounds to the nearest integer,
+and verifies `mask[voxel] == centroid_label` for every labeled vertebra.
+
+#### Querying QC results
+
+```bash
+# Headline numbers
+jq '.by_status, .by_check' data/qc/qc_manifest.json
+
+# Every flagged scan
+jq '.flagged_scans' data/qc/qc_manifest.json
+
+# Drill into one specific scan
+jq '.scans[] | select(.series_id == "verse051")' data/qc/qc_manifest.json
+
+# Distribution of centroid match rates
+jq '[.scans[] | .checks.centroid_alignment.match_rate // empty] | sort' \
+   data/qc/qc_manifest.json
+```
 
 ## Repository layout
 
 ```
 VerSeFusion/
-|-- Makefile                  one-line entry points (see `make help`)
-|-- README.md                 this file
-|-- LICENSE                   MIT (code) / CC-BY-SA-4.0 (data, upstream)
-|-- pyproject.toml
-|-- requirements.txt
-|-- configs/
-|   |-- default.env           non-secret defaults (single-word scalars only)
-|   |-- label_scheme.yaml     VerSe -> CTSpinoPelvic1K crosswalk
-|   `-- veridah_corrections.csv   Moeller 2026 manual corrections (25 rows)
-|-- containers/
-|   `-- README.md             SIF pull / reuse instructions
-|-- slurm/                    Warrior-HPC SLURM wrappers
-|   |-- _common.sh            shared env scrub + conda + singularity setup
-|   |-- hpc_pull.sh           pull SIF into containers/
-|   |-- download_raw.sh       stage 1
-|   |-- unify_iterations.sh   stage 2
-|   |-- apply_corrections.sh  stage 2.5 (VERIDAH)
-|   |-- reorient_pir.sh       stage 3 (auto-prefers corrected/)
-|   |-- build_manifest.sh     stage 4
-|   |-- make_splits.sh        stage 5
-|   `-- hf_export.sh          stage 6
-|-- nextflow/
-|   |-- main.nf
-|   `-- nextflow.config
-|-- src/verse_pipeline/
-|   |-- download.py           OSF REST API + throttling + retry-on-429
-|   |-- unify.py              VerSe19+20 merge with dedup
-|   |-- veridah.py            apply Moeller 2026 manual corrections
-|   |-- reorient.py           PIR reorientation (CT + mask + centroids)
-|   |-- manifest.py           placed_manifest.json builder
-|   |-- lstv.py               LSTV / T13 detection from centroid JSON
-|   |-- splits.py             5-fold CV
-|   |-- label_crosswalk.py    VerSe <-> CTSpinoPelvic1K
-|   |-- hf_export.py          HuggingFace flat-directory export
-|   |-- cli_inventory.py      per-source / per-anomaly counts
-|   `-- utils/{bids,centroid_json,nifti}.py
-|-- scripts/
-|   |-- hpc_pull.sh           SIF pull worker
-|   |-- inventory.py
-|   `-- qc_overview.py
-|-- tests/                    pytest suite (41 tests)
-|-- data/                     gitignored - staging dir
-|   |-- raw/{verse19,verse20}/    OSF-mirrored BIDS layout
-|   |-- unified/sub-verseNNN/     post-dedup
-|   |-- corrected/sub-verseNNN/   post-VERIDAH (mostly symlinks; ~15 materialized)
-|   |-- reoriented/sub-verseNNN/  PIR throughout
-|   `-- hf_export/                ct/, labels/, centroids/, splits/
-`-- docs/
-    |-- design.md
-    |-- label_scheme.md
-    `-- crosswalk.md
+├── configs/
+│   ├── default.env                  # Project paths, container settings
+│   ├── verse_demographics.csv       # TUM-published 374-row demographic table
+│   ├── veridah_corrections.csv      # Möller LSTV label corrections (chunk 2)
+│   └── label_scheme.yaml            # VerSe vertebra label scheme
+├── slurm/
+│   ├── _common.sh                   # Shared environment for all SLURM jobs
+│   ├── download_raw.sh              # Stage 1
+│   ├── unify_iterations.sh          # Stage 2
+│   └── qc.sh                        # Stage 3
+├── src/
+│   └── verse_pipeline/
+│       ├── __init__.py
+│       ├── download.py              # OSF fetcher + BIDS-fallback discovery
+│       ├── unify.py                 # raw → unified scan-dirs
+│       ├── qc.py                    # per-scan alignment audit
+│       └── utils/
+│           ├── __init__.py
+│           ├── demographics.py      # CSV loader, patient/series indexing
+│           └── miccai.py            # MICCAI+BIDS filename parser
+├── containers/                      # gitignored; built locally
+│   └── versefusion.sif
+├── data/                            # gitignored
+│   ├── raw/                         # Stage 1 output
+│   ├── unified/                     # Stage 2 output
+│   └── qc/                          # Stage 3 output
+├── logs/                            # gitignored
+├── Makefile
+├── README.md
+├── WEIGHTS.md                       # HuggingFace checkpoint download
+└── .gitignore
 ```
 
-## Quick start
+## Dataset accounting
+
+After running through unify on the full 374-row demographic table:
+
+| Metric                     | Count |
+|----------------------------|------:|
+| Total scans                | 374   |
+| Unique patients            | 355   |
+| Multi-series patients      | 18    |
+| Cross-release (v19 + v20)  | 105   |
+| Glocker cohort (gl* prefix)| 30    |
+| MICCAI-sourced             | 359   |
+| BIDS-sourced (partial recovery) | 15 |
+| Complete (CT + msk + ctd)  | 373   |
+| Missing one component      | 1     |
+
+One subject (`verse072`) lacks a published centroid file in both MICCAI and
+BIDS distributions. The CT and segmentation are present; users requiring
+centroids should either exclude this subject or derive centroids from the
+segmentation labels.
+
+## Reproducibility
+
+All sources of randomness in the pipeline are controllable:
+
+- Demographic ordering: deterministic from `configs/verse_demographics.csv`
+- File ordering: deterministic (sorted before parallel dispatch)
+- Cross-release tiebreaking: deterministic preference for v20
+- QC parallelism: process pool with deterministic future ordering
+
+Re-running any stage with the same inputs produces identical outputs.
+
+## Dependencies
+
+The pipeline runs inside a Singularity container (`containers/versefusion.sif`)
+built from `containers/versefusion.def`. The container provides:
+
+- Python 3.11
+- nibabel, numpy
+- requests
+- tqdm
+
+Build with:
 
 ```bash
-# 0.  one-time: pull a Singularity image into containers/versefusion.sif
-make hpc-pull-slurm       # defaults to reusing the ctspinopelvic1k image
-
-# 1.  pull all VerSe files from OSF (~1465 files, ~25 GB, resumable)
-make download-slurm
-
-# 2.  unify VerSe19 + VerSe20 into one subject-keyed tree
-make unify-slurm
-
-# 2.5  apply Moeller 2026 manual label corrections
-make correct-slurm
-
-# 3.  reorient everything to PIR (auto-prefers corrected/ from step 2.5)
-make reorient-slurm
-
-# 4.  build the manifest with LSTV/T13 flags
-make manifest-slurm
-
-# 5.  5-fold stratified splits
-make splits
-
-# 6.  HuggingFace flat-directory export
-make hf-export-slurm
-
-# audit at any time
-make lstv-audit            # prints normal/lstv/t13/both counts
-make inventory             # subjects per source / split / anomaly category
+make container
 ```
 
-Every `make X-slurm` target submits through `slurm/<target>.sh` with the
-right SBATCH directives.  The corresponding `make X` runs the same logic
-locally on the calling host (useful for development; not recommended for
-the 25 GB download).
+This requires root or the `--fakeroot` flag. On a cluster without root,
+build on a local workstation and `scp` the resulting `.sif`.
 
-`PYTHONPATH` is set automatically in both paths -- the Makefile exports
-`$(CURDIR)/src` for local targets, and `slurm/_common.sh` exports
-`PYTHONPATH` + `SINGULARITYENV_PYTHONPATH` for jobs running inside the
-container.  **No `pip install -e .` is required.**
+## Limitations
 
-## Data sources and provenance
+1. **One subject lacks a published centroid** (`verse072`). CT and mask
+   are intact; downstream users must decide whether to exclude or derive.
 
-### Why OSF, not S3
+2. **BIDS-recovered centroids are in voxel space, not 1mm-iso-ASL**. The
+   reorient stage handles this by dispatching on the
+   `centroid_coord_system` field in each scan's meta.json. Users
+   bypassing reorient must do the conversion themselves.
 
-The upstream README at https://github.com/anjany/verse documents six S3
-URLs at `s3.bonescreen.de/public/VerSe-complete/` as the canonical download.
-**Those URLs have been offline since May 2024** (see
-[verse#17](https://github.com/anjany/verse/issues/17)).  The BIDS-
-restructured ("subject-based") form of the data is mirrored on OSF under
-two child storage nodes the upstream README never explicitly linked to:
+3. **Castellvi grade-3/4 LSTV are not segmented in the upstream VerSe
+   labels.** The transitional vertebra is excluded by TUM's annotation
+   protocol. Our supplementary Castellvi-grade annotations fill this gap
+   (see paper).
 
-- VerSe 2019 subject-based: https://osf.io/jtfa5/
-- VerSe 2020 subject-based: https://osf.io/4skx2/
-
-`src/verse_pipeline/download.py` walks these via OSF's public REST API
-(`https://api.osf.io/v2/nodes/<id>/files/osfstorage/`) with:
-
-- **Pre-request throttling** (0.8 s per call) to stay under OSF's
-  ~100 req/min unauthenticated rate limit.
-- **Retry-on-429** with exponential backoff (2 s -> 4 s -> 8 s, up to 6
-  attempts), honouring `Retry-After` when OSF sends it.
-- **Per-file resumability**: rerunning skips files already on disk at the
-  expected size; only missing or corrupted files re-download.
-
-### VERIDAH manual corrections
-
-Moeller H. et al. (2026) — *VERIDAH: Solving Enumeration Anomaly Aware
-Vertebra Labeling across Imaging Sequences*, arXiv:2601.14066 — manually
-reviewed VerSe and identified 25 subjects with mislabeled enumeration
-anomalies (predominantly T13 cases where the extra thoracic vertebra was
-annotated as L1 with subsequent lumbar labels shifted down).
-
-VerSeFusion incorporates these via the `correct` stage:
-
-```
-configs/veridah_corrections.csv  ->  src/verse_pipeline/veridah.py
-        |
-        v
-data/unified/  ->  data/corrected/
-    (335 subjects symlinked through unchanged)
-    (~15 subjects with materialized corrected mask + centroid)
-```
-
-Two correction types are supported:
-
-- **T13 shift** (12 cases).  Remap: 20 -> 28, 21 -> 20, 22 -> 21, ...
-- **LabelOverride** (3 cases: `verse559`, `verse606`, `verse642_dir-sag`).
-  Full sequence replacement -- the entire vertebra label sequence was
-  re-seeded after VERIDAH review.
-
-Per-subject provenance (including the explicit `{old_label: new_label}`
-remap actually applied) is recorded in `data/corrected/veridah_manifest.json`
-for citation in the paper.
-
-The remaining 10 rows in the CSV are advisory-only: they flag TLTV
-(thoracolumbar transitional vertebra) and stump-rib morphology that
-Moeller's team noted but did not modify the label sequence for.  These
-flags surface in the manifest but do not change voxel labels.
-
-## Label scheme
-
-VerSe ships a 28-class vertebra index (see `docs/label_scheme.md`).
-Sacrum and coccyx labels (26, 27) exist in the scheme but are **not
-annotated** in the dataset -- VerSe is a vertebrae-only corpus.  Hips and
-pelvis are absent entirely.
-
-The crosswalk to CTSpinoPelvic1K's 10-class scheme is lossy in one
-direction (VerSe -> CTSpinoPelvic1K drops thoracic and cervical) and
-incomplete in the other (CTSpinoPelvic1K -> VerSe has no hip labels to
-map to).  See `docs/crosswalk.md`.
-
-| VerSe label | Region                       | CTSpinoPelvic1K equivalent |
-|------------:|------------------------------|---------------------------:|
-| 1-7         | C1-C7                        |     - (not in CTSPP1K)     |
-| 8-19        | T1-T12                       |     -                      |
-| 20-24       | L1-L5                        |          1-5               |
-| 25          | L6 (lumbarized LSTV)         |           6                |
-| 26          | sacrum (unannotated in VerSe)|           7                |
-| 27          | coccyx (unannotated)         |     -                      |
-| 28          | T13 (extra thoracic)         |     -                      |
+4. **Multi-series patients** are flattened to per-scan rows, not
+   per-patient. For patient-level splits, use the `patient_id` field in
+   each scan's meta.json.
 
 ## Citation
 
-If you use this pipeline, please cite **both** the original VerSe papers
-**and** the VERIDAH corrections paper:
+If you use this pipeline or the derived corpus, please cite:
 
 ```bibtex
-@article{sekuboyina2021verse,
-  title   = {VerSe: A Vertebrae Labelling and Segmentation Benchmark
-             for Multi-detector CT Images},
-  author  = {Sekuboyina, Anjany and others},
-  journal = {Medical Image Analysis},
-  year    = {2021}
-}
-
-@article{loffler2020verse,
-  title   = {A Vertebral Segmentation Dataset with Fracture Grading},
-  author  = {Loffler, Maximilian T. and others},
-  journal = {Radiology: Artificial Intelligence},
-  year    = {2020}
-}
-
-@article{liebl2021verse,
-  title   = {A Computed Tomography Vertebral Segmentation Dataset with
-             Anatomical Variations and Multi-Vendor Scanner Data},
-  author  = {Liebl, Hans and Schinz, David and others},
-  year    = {2021}
-}
-
-@article{moller2026veridah,
-  title   = {VERIDAH: Solving Enumeration Anomaly Aware Vertebra Labeling
-             across Imaging Sequences},
-  author  = {Moeller, Hendrik and others},
-  journal = {arXiv preprint arXiv:2601.14066},
-  year    = {2026}
+@inproceedings{anonymous2026versefusion,
+    title  = {[anonymous title for double-blind review]},
+    author = {Anonymous},
+    booktitle = {NeurIPS Datasets and Benchmarks Track},
+    year   = {2026},
+    note   = {Under review}
 }
 ```
 
-The data license is **CC-BY-SA 4.0** and attaches to any derivative
-exports this repo produces.  The VERIDAH corrections themselves are
-redistributed with the same license per agreement with the authors.
+The upstream VerSe distributions should also be cited:
+
+```bibtex
+@article{sekuboyina2021verse,
+    title   = {{VerSe}: A vertebrae labelling and segmentation benchmark
+               for multi-detector {CT} images},
+    author  = {Sekuboyina, Anjany and others},
+    journal = {Medical Image Analysis},
+    volume  = {73},
+    year    = {2021},
+}
+```
 
 ## License
 
-- **Code**: MIT (see `LICENSE`).
-- **Data exports** (`data/unified/`, `data/corrected/`,
-  `data/reoriented/`, `data/hf_export/`): inherit **CC-BY-SA 4.0** from
-  upstream VerSe.
+The pipeline code in this repository is released under the MIT License.
 
-## Acknowledgements
+The underlying VerSe dataset is distributed by TUM under CC BY 4.0; users
+of the derived corpus must comply with VerSe's terms. Pretrained weights
+follow the same CC BY 4.0 license.
 
-This repo would not exist without:
-
-- The VerSe team at TUM (Sekuboyina, Liebl, Loffler, Kirschke et al.) who
-  built and curated the original dataset.
-- Hendrik Moeller (TUM) for sharing the VERIDAH manual corrections and
-  for the underlying labeling methodology that motivated this fusion.
-- The community of users in `verse#17` who surfaced the OSF subject-based
-  node IDs that replaced the dead S3 endpoint.
+See `LICENSE` for the full text.

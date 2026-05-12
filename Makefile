@@ -1,218 +1,257 @@
 # =============================================================================
 # VerSeFusion — Makefile
 #
-# Each target has a local variant (runs in current shell) and a -slurm variant
-# (submits the equivalent script under slurm/).  All paths are configurable
-# via env or configs/default.env (sourced automatically).
+# Drives the full pipeline:
+#   download → unify → qc → (reorient + veridah, see chunk 2)
+#
+# Most stages run via SLURM (the *-slurm targets) because the cluster has
+# Singularity + the canonical environment.  Each stage also has a *-local
+# fallback for interactive use on a login node.
+#
+# Run `make help` for a summary of every target.
 # =============================================================================
 
-SHELL := /bin/bash
-.SHELLFLAGS := -eu -o pipefail -c
-.ONESHELL:
+REPO_ROOT     := $(shell pwd)
+DATA_DIR      := $(REPO_ROOT)/data
+RAW_DIR       := $(DATA_DIR)/raw
+UNIFIED_DIR   := $(DATA_DIR)/unified
+QC_DIR        := $(DATA_DIR)/qc
+LOGS_DIR      := $(REPO_ROOT)/logs
 
-# --- load non-secret defaults -------------------------------------------------
-ifneq (,$(wildcard configs/default.env))
-    include configs/default.env
-    export
-endif
+CONFIG_DIR    := $(REPO_ROOT)/configs
+DEMOGRAPHICS  := $(CONFIG_DIR)/verse_demographics.csv
 
-# --- optional secrets layer (gitignored) --------------------------------------
-ifneq (,$(wildcard env.local))
-    include env.local
-    export
-endif
+CONTAINERS_DIR := $(REPO_ROOT)/containers
+CONTAINER_SIF  := $(CONTAINERS_DIR)/versefusion.sif
+CONTAINER_DEF  := $(CONTAINERS_DIR)/versefusion.def
 
-# --- defaults (may be overridden via env or configs/default.env) --------------
-DATA_DIR       ?= $(CURDIR)/data
-RAW_DIR        ?= $(DATA_DIR)/raw
-UNIFIED_DIR    ?= $(DATA_DIR)/unified
-CORRECTED_DIR  ?= $(DATA_DIR)/corrected
-REORIENTED_DIR ?= $(DATA_DIR)/reoriented
-HF_DIR         ?= $(DATA_DIR)/hf_export
-LOG_DIR        ?= $(CURDIR)/logs
+SRC_DIR       := $(REPO_ROOT)/src
 
-PYTHON         ?= python3
-PIP            ?= pip
-
-# Make src/ importable as `verse_pipeline` for local (non-SLURM) targets
-# without needing `pip install -e .`.  Mirrors what slurm/_common.sh does
-# inside SLURM jobs.
-export PYTHONPATH := $(CURDIR)/src:$(PYTHONPATH)
+# Tunables — override on the command line: `make download-slurm DOWNLOAD_WORKERS=16`
+DOWNLOAD_WORKERS ?= 8
+QC_WORKERS       ?= 8
 
 .DEFAULT_GOAL := help
 
-# =============================================================================
-# meta
-# =============================================================================
+# Use bash, fail on first error
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+
+# -----------------------------------------------------------------------------
+# Help
+# -----------------------------------------------------------------------------
+
 .PHONY: help
-help:  ## Show this help.
+help:
+	@echo "VerSeFusion pipeline targets"
 	@echo ""
-	@echo "VerSeFusion — make targets"
-	@echo "=========================="
-	@awk 'BEGIN{FS=":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@echo "  Setup:"
+	@echo "    setup              Create dirs, fetch demographics if missing"
+	@echo "    container          Build Singularity .sif from .def"
 	@echo ""
-	@echo "Configurable paths:"
-	@echo "  DATA_DIR       = $(DATA_DIR)"
-	@echo "  RAW_DIR        = $(RAW_DIR)"
-	@echo "  UNIFIED_DIR    = $(UNIFIED_DIR)"
-	@echo "  CORRECTED_DIR  = $(CORRECTED_DIR)"
-	@echo "  REORIENTED_DIR = $(REORIENTED_DIR)"
-	@echo "  HF_DIR         = $(HF_DIR)"
+	@echo "  Stage 1 — Download (OSF → data/raw/):"
+	@echo "    download-slurm     Submit SLURM job (recommended on cluster)"
+	@echo "    download-local     Run interactively on the current node"
+	@echo "    download-clean     Wipe data/raw/ (irreversible)"
 	@echo ""
+	@echo "  Stage 2 — Unify (data/raw/ → data/unified/):"
+	@echo "    unify-slurm        Submit SLURM job"
+	@echo "    unify-local        Run interactively"
+	@echo "    unify-clean        Wipe data/unified/"
+	@echo ""
+	@echo "  Stage 3 — QC alignment audit (data/unified/ → data/qc/):"
+	@echo "    qc-slurm           Submit SLURM job"
+	@echo "    qc-local           Run interactively"
+	@echo "    qc-clean           Wipe data/qc/"
+	@echo ""
+	@echo "  Convenience:"
+	@echo "    all-slurm          download → unify → qc, sequentially (SLURM)"
+	@echo "    status             Show what's been produced so far"
+	@echo "    clean-all          Wipe data/ entirely (DESTRUCTIVE)"
+	@echo ""
+	@echo "  Tunables (override on command line):"
+	@echo "    DOWNLOAD_WORKERS=$(DOWNLOAD_WORKERS)  parallel download threads"
+	@echo "    QC_WORKERS=$(QC_WORKERS)        parallel QC workers"
+	@echo ""
+	@echo "  Example:"
+	@echo "    make download-slurm DOWNLOAD_WORKERS=16"
+	@echo "    DOWNLOAD_FLAGS=\"--no_bids_fallback\" sbatch slurm/download_raw.sh"
 
-.PHONY: install
-install:  ## pip install -e .[dev]
-	$(PIP) install -e ".[dev]"
+# -----------------------------------------------------------------------------
+# Setup
+# -----------------------------------------------------------------------------
 
-.PHONY: clean
-clean:  ## Remove __pycache__ and build artefacts (preserves data/).
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	rm -rf build dist *.egg-info .pytest_cache .ruff_cache .mypy_cache
-	@echo "Clean done.  data/ preserved."
+.PHONY: setup
+setup:
+	@mkdir -p $(RAW_DIR) $(UNIFIED_DIR) $(QC_DIR) $(LOGS_DIR)
+	@if [ ! -f $(DEMOGRAPHICS) ]; then \
+	    echo "ERROR: $(DEMOGRAPHICS) not found."; \
+	    echo "Place TUM's verse_datasets_age_sex_19.xlsx, exported as CSV, at this path."; \
+	    exit 1; \
+	fi
+	@echo "Setup OK. Dirs created, demographics found."
 
-.PHONY: deep-clean
-deep-clean: clean  ## Remove pipeline outputs too (data/, logs/, work/).
-	rm -rf $(DATA_DIR) $(LOG_DIR) work/ .nextflow*
+.PHONY: container
+container:
+	@mkdir -p $(CONTAINERS_DIR)
+	@if [ ! -f $(CONTAINER_DEF) ]; then \
+	    echo "ERROR: $(CONTAINER_DEF) not found; cannot build container."; \
+	    exit 1; \
+	fi
+	cd $(CONTAINERS_DIR) && singularity build --fakeroot \
+	    $(CONTAINER_SIF) $(CONTAINER_DEF)
 
-# =============================================================================
-# stage 0 — container pull (HPC)
-# =============================================================================
-.PHONY: hpc-pull
-hpc-pull:  ## Pull a Docker Hub image -> containers/versefusion.sif on Warrior HPC.
-	mkdir -p containers logs
-	bash scripts/hpc_pull.sh
+# -----------------------------------------------------------------------------
+# Stage 1 — Download
+# -----------------------------------------------------------------------------
 
-.PHONY: hpc-pull-slurm
-hpc-pull-slurm:  ## Submit hpc-pull as a SLURM job.
-	mkdir -p $(LOG_DIR)
-	sbatch slurm/hpc_pull.sh
+.PHONY: download-slurm download-local download-clean
 
-# =============================================================================
-# stage 1 — download (OSF)
-# =============================================================================
-.PHONY: download
-download:  ## Pull the VerSe BIDS data from OSF (~1465 files, resumable).
-	mkdir -p $(RAW_DIR) $(LOG_DIR)
-	$(PYTHON) -m verse_pipeline.download --out_dir $(RAW_DIR)
+download-slurm: setup
+	@mkdir -p $(LOGS_DIR)
+	sbatch $(REPO_ROOT)/slurm/download_raw.sh
 
-.PHONY: download-slurm
-download-slurm:  ## Submit download as a SLURM job.
-	mkdir -p $(LOG_DIR)
-	sbatch slurm/download_raw.sh
+download-local: setup
+	cd $(REPO_ROOT) && \
+	PYTHONPATH=$(SRC_DIR) python -m verse_pipeline.download \
+	    --out_dir      $(RAW_DIR) \
+	    --workers      $(DOWNLOAD_WORKERS) \
+	    --demographics $(DEMOGRAPHICS)
 
-# =============================================================================
-# stage 2 — unify
-# =============================================================================
-.PHONY: unify
-unify:  ## Merge VerSe19+VerSe20, dedup, flatten to data/unified/sub-*/.
-	mkdir -p $(UNIFIED_DIR) $(LOG_DIR)
-	$(PYTHON) -m verse_pipeline.unify \
-	    --raw_dir $(RAW_DIR) \
-	    --out_dir $(UNIFIED_DIR)
+download-clean:
+	@echo "Removing $(RAW_DIR) ..."
+	rm -rf $(RAW_DIR)
+	@mkdir -p $(RAW_DIR)
 
-.PHONY: unify-slurm
-unify-slurm:  ## Submit unify as a SLURM job.
-	mkdir -p $(LOG_DIR)
-	sbatch slurm/unify_iterations.sh
+# -----------------------------------------------------------------------------
+# Stage 2 — Unify
+# -----------------------------------------------------------------------------
 
-# =============================================================================
-# stage 2.5 — VERIDAH (Moeller 2026) label corrections
-# =============================================================================
-.PHONY: correct
-correct:  ## Apply Moeller's manual label corrections to ~25 subjects.
-	mkdir -p $(CORRECTED_DIR) $(LOG_DIR)
-	$(PYTHON) -m verse_pipeline.veridah \
-	    --in_dir          $(UNIFIED_DIR) \
-	    --out_dir         $(CORRECTED_DIR) \
-	    --corrections_csv $(CURDIR)/configs/veridah_corrections.csv
+.PHONY: unify-slurm unify-local unify-clean
 
-.PHONY: correct-slurm
-correct-slurm:  ## Submit correct as a SLURM job.
-	mkdir -p $(LOG_DIR)
-	sbatch slurm/apply_corrections.sh
+unify-slurm: setup
+	@mkdir -p $(LOGS_DIR)
+	sbatch $(REPO_ROOT)/slurm/unify_iterations.sh
 
-# =============================================================================
-# stage 3 — reorient to PIR
-# =============================================================================
-.PHONY: reorient
-reorient:  ## Reorient every CT + mask to PIR.  Prefers corrected/ if it exists.
-	mkdir -p $(REORIENTED_DIR) $(LOG_DIR)
-	@if [ -d "$(CORRECTED_DIR)" ] && [ -n "$$(ls -A $(CORRECTED_DIR) 2>/dev/null)" ]; then \
-	    echo "Reorienting from $(CORRECTED_DIR) (post-VERIDAH)"; \
-	    IN_DIR=$(CORRECTED_DIR); \
+unify-local: setup
+	cd $(REPO_ROOT) && \
+	PYTHONPATH=$(SRC_DIR) python -m verse_pipeline.unify \
+	    --raw_dir      $(RAW_DIR) \
+	    --out_dir      $(UNIFIED_DIR) \
+	    --demographics $(DEMOGRAPHICS)
+
+unify-clean:
+	@echo "Removing $(UNIFIED_DIR) ..."
+	rm -rf $(UNIFIED_DIR)
+	@mkdir -p $(UNIFIED_DIR)
+
+# -----------------------------------------------------------------------------
+# Stage 3 — QC alignment audit
+# -----------------------------------------------------------------------------
+
+.PHONY: qc-slurm qc-local qc-clean
+
+qc-slurm: setup
+	@mkdir -p $(LOGS_DIR)
+	sbatch $(REPO_ROOT)/slurm/qc.sh
+
+qc-local: setup
+	cd $(REPO_ROOT) && \
+	PYTHONPATH=$(SRC_DIR) python -m verse_pipeline.qc \
+	    --unified_dir $(UNIFIED_DIR) \
+	    --out_dir     $(QC_DIR) \
+	    --workers     $(QC_WORKERS)
+
+qc-clean:
+	@echo "Removing $(QC_DIR) ..."
+	rm -rf $(QC_DIR)
+	@mkdir -p $(QC_DIR)
+
+# -----------------------------------------------------------------------------
+# Convenience: run everything
+# -----------------------------------------------------------------------------
+
+# `all-slurm` submits each stage in sequence with --dependency=afterok so
+# they chain automatically through the SLURM queue.  Each step waits for
+# the previous one to complete successfully before starting.
+.PHONY: all-slurm
+all-slurm: setup
+	@mkdir -p $(LOGS_DIR)
+	@DOWNLOAD_JOB=$$(sbatch --parsable $(REPO_ROOT)/slurm/download_raw.sh); \
+	echo "submitted download as job $$DOWNLOAD_JOB"; \
+	UNIFY_JOB=$$(sbatch --parsable --dependency=afterok:$$DOWNLOAD_JOB \
+	    $(REPO_ROOT)/slurm/unify_iterations.sh); \
+	echo "submitted unify as job $$UNIFY_JOB (after $$DOWNLOAD_JOB)"; \
+	QC_JOB=$$(sbatch --parsable --dependency=afterok:$$UNIFY_JOB \
+	    $(REPO_ROOT)/slurm/qc.sh); \
+	echo "submitted qc as job $$QC_JOB (after $$UNIFY_JOB)"; \
+	echo ""; \
+	echo "Watch with:  squeue -u $$USER"
+
+# -----------------------------------------------------------------------------
+# Status / inspection
+# -----------------------------------------------------------------------------
+
+.PHONY: status
+status:
+	@echo "===== VerSeFusion pipeline status ====="
+	@echo ""
+	@echo "Demographics:"
+	@if [ -f $(DEMOGRAPHICS) ]; then \
+	    echo "  $(DEMOGRAPHICS)  ($$(wc -l < $(DEMOGRAPHICS)) lines)"; \
 	else \
-	    echo "Reorienting from $(UNIFIED_DIR) (no VERIDAH corrections applied)"; \
-	    IN_DIR=$(UNIFIED_DIR); \
-	fi; \
-	$(PYTHON) -m verse_pipeline.reorient \
-	    --in_dir  "$$IN_DIR" \
-	    --out_dir $(REORIENTED_DIR)
+	    echo "  MISSING: $(DEMOGRAPHICS)"; \
+	fi
+	@echo ""
+	@echo "Container:"
+	@if [ -f $(CONTAINER_SIF) ]; then \
+	    echo "  $(CONTAINER_SIF)  ($$(du -h $(CONTAINER_SIF) | cut -f1))"; \
+	else \
+	    echo "  MISSING: $(CONTAINER_SIF)  (run 'make container')"; \
+	fi
+	@echo ""
+	@echo "Stage 1 (download):"
+	@if [ -f $(RAW_DIR)/download_manifest.json ]; then \
+	    echo "  manifest: $(RAW_DIR)/download_manifest.json"; \
+	    jq -r '"  n_files=\(.n_files)  downloaded=\(.n_downloaded)  cached=\(.n_cached)  failed=\(.n_failed)"' \
+	        $(RAW_DIR)/download_manifest.json 2>/dev/null \
+	        || echo "  (jq not available — check manifest manually)"; \
+	else \
+	    echo "  not run yet"; \
+	fi
+	@echo ""
+	@echo "Stage 2 (unify):"
+	@if [ -f $(UNIFIED_DIR)/unify_manifest.json ]; then \
+	    echo "  manifest: $(UNIFIED_DIR)/unify_manifest.json"; \
+	    jq -r '"  n_scans=\(.n_scans)  n_patients=\(.n_patients)  complete=\(.completeness.n_complete)"' \
+	        $(UNIFIED_DIR)/unify_manifest.json 2>/dev/null \
+	        || echo "  (jq not available)"; \
+	else \
+	    echo "  not run yet"; \
+	fi
+	@echo ""
+	@echo "Stage 3 (qc):"
+	@if [ -f $(QC_DIR)/qc_manifest.json ]; then \
+	    echo "  manifest: $(QC_DIR)/qc_manifest.json"; \
+	    jq -r '.by_status | "  PASS=\(.PASS)  WARN=\(.WARN)  FAIL=\(.FAIL)  SKIP=\(.SKIP)"' \
+	        $(QC_DIR)/qc_manifest.json 2>/dev/null \
+	        || echo "  (jq not available)"; \
+	else \
+	    echo "  not run yet"; \
+	fi
+	@echo ""
+	@echo "Recent SLURM logs:"
+	@ls -lt $(LOGS_DIR)/*.err 2>/dev/null | head -5 | awk '{print "  " $$0}' \
+	    || echo "  (no logs yet)"
 
-.PHONY: reorient-slurm
-reorient-slurm:  ## Submit reorient as a SLURM job (auto-prefers corrected/).
-	mkdir -p $(LOG_DIR)
-	sbatch slurm/reorient_pir.sh
+# -----------------------------------------------------------------------------
+# Destructive cleanup
+# -----------------------------------------------------------------------------
 
-# =============================================================================
-# stage 4 — manifest + LSTV audit
-# =============================================================================
-.PHONY: manifest
-manifest:  ## Build placed_manifest.json with anomaly flags + VERIDAH provenance.
-	$(PYTHON) -m verse_pipeline.manifest \
-	    --in_dir   $(REORIENTED_DIR) \
-	    --out_path $(REORIENTED_DIR)/placed_manifest.json
-
-.PHONY: manifest-slurm
-manifest-slurm:  ## Submit manifest as a SLURM job.
-	mkdir -p $(LOG_DIR)
-	sbatch slurm/build_manifest.sh
-
-.PHONY: lstv-audit
-lstv-audit:  ## Print LSTV / T13 / normal counts to stdout.
-	$(PYTHON) -m verse_pipeline.lstv --audit \
-	    --manifest $(REORIENTED_DIR)/placed_manifest.json
-
-# =============================================================================
-# stage 5 — splits
-# =============================================================================
-.PHONY: splits
-splits:  ## 5-fold CV stratified by anomaly category.
-	$(PYTHON) -m verse_pipeline.splits \
-	    --manifest $(REORIENTED_DIR)/placed_manifest.json \
-	    --out_dir  $(REORIENTED_DIR)/splits
-
-# =============================================================================
-# stage 6 — HuggingFace export
-# =============================================================================
-.PHONY: hf-export
-hf-export:  ## Build HuggingFace flat directory under data/hf_export/.
-	mkdir -p $(HF_DIR)
-	$(PYTHON) -m verse_pipeline.hf_export \
-	    --in_dir  $(REORIENTED_DIR) \
-	    --out_dir $(HF_DIR)
-
-.PHONY: hf-export-slurm
-hf-export-slurm:  ## Submit hf-export as a SLURM job.
-	mkdir -p $(LOG_DIR)
-	sbatch slurm/hf_export.sh
-
-# =============================================================================
-# QA / utility
-# =============================================================================
-.PHONY: inventory
-inventory:  ## Print per-source / per-split / per-anomaly subject counts.
-	$(PYTHON) -m verse_pipeline.cli_inventory \
-	    --manifest $(REORIENTED_DIR)/placed_manifest.json
-
-.PHONY: test
-test:  ## Run pytest suite.
-	$(PYTHON) -m pytest tests/ -v
-
-.PHONY: lint
-lint:  ## Run ruff + mypy.
-	$(PYTHON) -m ruff check src/ tests/
-	$(PYTHON) -m mypy src/
-
-.PHONY: full-pipeline
-full-pipeline: download unify correct reorient manifest splits hf-export  ## Run every stage end-to-end (local).
-	@echo "Full pipeline complete.  Output at $(HF_DIR)"
+.PHONY: clean-all
+clean-all:
+	@echo "WARNING: this will delete $(DATA_DIR) entirely."
+	@echo "Press Ctrl-C in the next 5 seconds to abort..."
+	@sleep 5
+	rm -rf $(DATA_DIR)
+	@echo "$(DATA_DIR) removed."
