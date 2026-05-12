@@ -11,7 +11,7 @@
 #SBATCH --mail-type=END,FAIL
 
 # Group raw MICCAI files by series_id, materialise scan-<series_id>/ dirs,
-# resolve cross-release ties via demographics spreadsheet (TUM-published).
+# resolve cross-release ties via demographics CSV (TUM-published).
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
@@ -24,4 +24,4 @@ singularity exec \
     python -m verse_pipeline.unify \
         --raw_dir       "${RAW_DIR}" \
         --out_dir       "${UNIFIED_DIR}" \
-        --demographics  "${REPO_ROOT}/configs/verse_demographics.xlsx"
+        --demographics  "${REPO_ROOT}/configs/verse_demographics.csv"
