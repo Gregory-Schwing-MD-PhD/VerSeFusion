@@ -1,21 +1,17 @@
 """
-visualize.py — per-scan QC renders for canonically reoriented scans.
+visualize.py — per-scan QC renders for canonical (PIR) VerSe scans.
 
-For each scan in data/canonical/scan-*/, generates a 3-panel PNG with:
-  - CT in bone window, grayscale background
-  - Mask labels overlaid in distinct semi-transparent colors
-  - Mask-derived center-of-mass markers (yellow dots, labeled by vertebra number)
+For each scan in data/canonical/scan-*/, generates a 3-row × 2-col PNG:
+  Row 0: Coronal  (slice along axis 0, the P direction)
+  Row 1: Axial    (slice along axis 1, the I direction)
+  Row 2: Sagittal (slice along axis 2, the R direction — display is transposed)
+  Col 0: Raw CT (bone window)
+  Col 1: CT + vertebra mask + centroid markers
 
-Inputs are already in PIR orientation (per the reorient stage), so this
-module loads the canonical NIfTIs and plots directly — no orientation
-handling needed.  Axis 0 = P, axis 1 = I, axis 2 = R.
+Stored volumes are PIR.  Sagittal slices are transposed so head appears at top.
 
-Usage
------
-    python -m verse_pipeline.visualize \\
-        --input_dir data/canonical \\
-        --out_dir   data/qc/renders \\
-        --limit     10
+Output: data/qc/renders/<series_id>.png
+        data/qc/renders/renders_manifest.json
 """
 
 from __future__ import annotations
@@ -31,10 +27,11 @@ from typing import Any
 
 import numpy as np
 import nibabel as nib
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
+from matplotlib import patheffects as mpe
 
 log = logging.getLogger("verse.visualize")
 
@@ -43,172 +40,197 @@ log = logging.getLogger("verse.visualize")
 # constants
 # =============================================================================
 
-CT_DISPLAY_MIN = -200
-CT_DISPLAY_MAX = 1500
-
+_HU_MIN, _HU_MAX = -200, 800
+DEFAULT_DPI = 100
 SLICE_TOLERANCE_VOX = 10
-DEFAULT_DPI = 80
+
+CENTROID_MARKER_SIZE      = 7
+CENTROID_LABEL_FONTSIZE   = 10
+CENTROID_LABEL_OFFSET     = (8, 6)
+CENTROID_MARKER_EDGEWIDTH = 1.0
+
+_VERSE_COLORS: dict[int, tuple[float, float, float, float]] = {
+    1:  (0.30, 0.55, 0.95, 0.55),  2:  (0.25, 0.50, 0.90, 0.55),
+    3:  (0.20, 0.45, 0.85, 0.55),  4:  (0.20, 0.40, 0.80, 0.55),
+    5:  (0.15, 0.35, 0.75, 0.55),  6:  (0.15, 0.30, 0.70, 0.55),
+    7:  (0.10, 0.25, 0.65, 0.55),
+    8:  (0.10, 0.55, 0.65, 0.55),  9:  (0.10, 0.60, 0.60, 0.55),
+    10: (0.10, 0.65, 0.55, 0.55),  11: (0.10, 0.70, 0.50, 0.55),
+    12: (0.10, 0.75, 0.45, 0.55),  13: (0.15, 0.78, 0.40, 0.55),
+    14: (0.20, 0.80, 0.35, 0.55),  15: (0.30, 0.82, 0.30, 0.55),
+    16: (0.40, 0.85, 0.25, 0.55),  17: (0.50, 0.87, 0.20, 0.55),
+    18: (0.60, 0.88, 0.15, 0.55),  19: (0.70, 0.90, 0.10, 0.55),
+    20: (0.95, 0.85, 0.10, 0.55),  21: (0.95, 0.75, 0.10, 0.55),
+    22: (0.95, 0.65, 0.10, 0.55),  23: (0.95, 0.55, 0.10, 0.55),
+    24: (0.95, 0.45, 0.10, 0.55),  25: (0.95, 0.35, 0.10, 0.55),
+    26: (0.95, 0.20, 0.15, 0.60),
+    27: (0.85, 0.20, 0.85, 0.60),
+    28: (0.55, 0.20, 0.85, 0.65),
+}
+
+_PLANE_AXIS_NAMES = {0: "p", 1: "i", 2: "r"}
+_PLANES: list[tuple[int, str]] = [(0, "Coronal"), (1, "Axial"), (2, "Sagittal")]
 
 
 # =============================================================================
-# rendering
+# helpers
 # =============================================================================
 
-def _make_label_cmap() -> mcolors.ListedColormap:
-    base  = plt.get_cmap("tab20")(np.linspace(0, 1, 20))
-    extra = plt.get_cmap("Set3")(np.linspace(0, 1, 12))
-    colors = np.vstack([base, extra])[:29]
-    colors[0] = [0, 0, 0, 0]
-    return mcolors.ListedColormap(colors)
+def _window(ct: np.ndarray) -> np.ndarray:
+    return np.clip((ct - _HU_MIN) / (_HU_MAX - _HU_MIN), 0.0, 1.0)
 
 
-def _bone_window(ct_data: np.ndarray) -> np.ndarray:
-    clipped = np.clip(ct_data, CT_DISPLAY_MIN, CT_DISPLAY_MAX)
-    return (clipped - CT_DISPLAY_MIN) / (CT_DISPLAY_MAX - CT_DISPLAY_MIN)
-
-
-def _best_slice_idx(msk_data: np.ndarray, axis: int) -> int:
-    if not np.any(msk_data > 0):
-        return msk_data.shape[axis] // 2
-    sum_axes = tuple(a for a in range(msk_data.ndim) if a != axis)
-    profile = np.sum(msk_data > 0, axis=sum_axes)
-    return int(np.argmax(profile))
-
-
-def mask_centers_of_mass(msk_data: np.ndarray, labels: list[int]) -> dict[int, tuple[float, float, float]]:
-    out: dict[int, tuple[float, float, float]] = {}
-    for label in labels:
-        coords = np.argwhere(msk_data == label)
-        if len(coords) == 0:
+def _overlay(base_2d: np.ndarray, lbl_2d: np.ndarray,
+             cmap: dict[int, tuple[float, float, float, float]]) -> np.ndarray:
+    if base_2d.ndim == 2:
+        rgb = np.stack([base_2d, base_2d, base_2d], axis=-1).astype(np.float32)
+    else:
+        rgb = base_2d.astype(np.float32).copy()
+    for v, (r, g, b, a) in cmap.items():
+        m = (lbl_2d == v)
+        if not m.any():
             continue
-        com = coords.mean(axis=0)
-        out[label] = tuple(float(v) for v in com)
+        rgb[m, 0] = rgb[m, 0] * (1 - a) + r * a
+        rgb[m, 1] = rgb[m, 1] * (1 - a) + g * a
+        rgb[m, 2] = rgb[m, 2] * (1 - a) + b * a
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def _display_slice(arr2d: np.ndarray, dim: int) -> np.ndarray:
+    return arr2d.T if dim == 2 else arr2d
+
+
+def _safe_slice(arr: np.ndarray, dim: int, idx: int) -> np.ndarray:
+    clamped = int(np.clip(idx, 0, arr.shape[dim] - 1))
+    s = [slice(None)] * arr.ndim
+    s[dim] = clamped
+    return arr[tuple(s)]
+
+
+def _choose_slices(ct: np.ndarray, msk: np.ndarray) -> tuple[int, int, int]:
+    nonzero = np.argwhere(msk > 0) if msk is not None else None
+    if nonzero is None or len(nonzero) == 0:
+        return tuple(s // 2 for s in ct.shape)
+    p = int(np.clip(int(nonzero[:, 0].mean()), 0, ct.shape[0] - 1))
+    i = int(np.clip(int(nonzero[:, 1].mean()), 0, ct.shape[1] - 1))
+    r = int(np.clip(int(nonzero[:, 2].mean()), 0, ct.shape[2] - 1))
+    return (p, i, r)
+
+
+def _label_coms(msk_data: np.ndarray, labels: list[int]) -> dict[int, tuple[float, float, float]]:
+    out: dict[int, tuple[float, float, float]] = {}
+    for lbl in labels:
+        coords = np.argwhere(msk_data == lbl)
+        if len(coords) > 0:
+            com = coords.mean(axis=0)
+            out[lbl] = tuple(float(v) for v in com)
     return out
 
 
-def _draw_panel(
-    ax,
-    ct_slice: np.ndarray,
-    msk_slice: np.ndarray,
-    label_cmap: mcolors.ListedColormap,
-    com_in_plane: list[tuple[int, float, float, bool]],
-    title: str,
-    xlabel: str,
-    ylabel: str,
-) -> None:
-    """Draw one orthogonal panel.
+def _centroid_screen_xy(com_pir, dim):
+    p, i, r = com_pir
+    if dim == 0:  return (r, i)
+    if dim == 1:  return (r, p)
+    return (p, i)
 
-    com_in_plane: list of (label, screen_x, screen_y, in_or_near_slice_bool)
-    """
-    ax.imshow(ct_slice.T, cmap="gray", origin="lower", aspect="equal",
-              vmin=0, vmax=1, interpolation="nearest")
-    masked = np.ma.masked_where(msk_slice == 0, msk_slice).T
-    ax.imshow(masked, cmap=label_cmap, alpha=0.45, origin="lower",
-              aspect="equal", vmin=0, vmax=28, interpolation="nearest")
 
-    for label, x, y, in_plane in com_in_plane:
-        alpha = 1.0 if in_plane else 0.25
-        ax.plot(x, y, marker="o", color="#FFD500", markersize=6,
-                markeredgecolor="black", markeredgewidth=0.8,
-                alpha=alpha, linestyle="")
-        if in_plane:
-            ax.annotate(str(label), xy=(x, y), color="#FFFF80",
-                        fontsize=8, weight="bold",
-                        xytext=(7, 7), textcoords="offset points")
+def _draw_centroid_markers(ax, coms, dim, mid_idx) -> None:
+    for lbl, com in coms.items():
+        if dim == 0:    in_slice = abs(com[0] - mid_idx) < SLICE_TOLERANCE_VOX
+        elif dim == 1:  in_slice = abs(com[1] - mid_idx) < SLICE_TOLERANCE_VOX
+        else:           in_slice = abs(com[2] - mid_idx) < SLICE_TOLERANCE_VOX
+        if not in_slice:
+            continue
+        x, y = _centroid_screen_xy(com, dim)
+        ax.plot(x, y, marker="o", color="#FFE000",
+                markersize=CENTROID_MARKER_SIZE,
+                markeredgecolor="#222",
+                markeredgewidth=CENTROID_MARKER_EDGEWIDTH,
+                linestyle="")
+        ax.annotate(
+            str(lbl), xy=(x, y), color="#FFE000",
+            fontsize=CENTROID_LABEL_FONTSIZE, weight="bold",
+            xytext=CENTROID_LABEL_OFFSET, textcoords="offset points",
+            path_effects=[mpe.withStroke(linewidth=2.5, foreground="#111")],
+        )
 
-    ax.set_title(title, fontsize=11)
-    ax.set_xlabel(xlabel, fontsize=9)
-    ax.set_ylabel(ylabel, fontsize=9)
-    ax.tick_params(labelsize=7)
 
+# =============================================================================
+# per-scan render
+# =============================================================================
 
 def render_scan(scan_dir: Path, out_path: Path,
                 dpi: int = DEFAULT_DPI) -> dict[str, Any]:
-    """Render one canonical scan."""
     series_id = scan_dir.name.replace("scan-", "")
     meta_path = scan_dir / f"scan-{series_id}_meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(f"no meta.json at {meta_path}")
     meta = json.loads(meta_path.read_text())
 
-    ct_path  = Path(meta["source_paths"]["ct"])
-    msk_path = Path(meta["source_paths"]["msk"])
-
-    ct_img  = nib.load(str(ct_path))
-    msk_img = nib.load(str(msk_path))
-
+    ct_img  = nib.load(meta["source_paths"]["ct"])
+    msk_img = nib.load(meta["source_paths"]["msk"])
     ct_data  = np.asarray(ct_img.dataobj).astype(np.float32)
     msk_data = np.asarray(msk_img.dataobj).astype(np.int32)
 
-    spacing = tuple(float(np.linalg.norm(ct_img.affine[:3, i])) for i in range(3))
-    ct_display = _bone_window(ct_data)
+    mn = tuple(min(a, b) for a, b in zip(ct_data.shape, msk_data.shape))
+    ct_data  = ct_data [:mn[0], :mn[1], :mn[2]]
+    msk_data = msk_data[:mn[0], :mn[1], :mn[2]]
 
+    spacing = tuple(float(np.linalg.norm(ct_img.affine[:3, k])) for k in range(3))
     labels_present = sorted(int(l) for l in np.unique(msk_data) if l != 0)
-    coms = mask_centers_of_mass(msk_data, labels_present)
+    coms = _label_coms(msk_data, labels_present)
 
-    cmap = _make_label_cmap()
+    p_idx, i_idx, r_idx = _choose_slices(ct_data, msk_data)
+    slice_by_dim = {0: p_idx, 1: i_idx, 2: r_idx}
 
-    mid_p = _best_slice_idx(msk_data, axis=0)
-    mid_i = _best_slice_idx(msk_data, axis=1)
-    mid_r = _best_slice_idx(msk_data, axis=2)
+    fig, axes = plt.subplots(3, 2, figsize=(9, 13),
+                              gridspec_kw={"hspace": 0.04, "wspace": 0.04})
+    fig.patch.set_facecolor("#111111")
+    for ax in axes.flat:
+        ax.set_facecolor("#111111")
+        ax.axis("off")
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 7))
+    axes[0, 0].set_title("Raw CT",          fontsize=10, color="#cccccc", pad=2)
+    axes[0, 1].set_title("CT + mask + CoM", fontsize=10, color="#cccccc", pad=2)
 
-    # Sagittal: slice along R (axis 2), view (P, I) plane = (axis 0, axis 1)
-    ct_slice  = ct_display[:, :, mid_r]
-    msk_slice = msk_data  [:, :, mid_r]
-    com_in_plane = [(label, com[0], com[1],
-                     abs(com[2] - mid_r) < SLICE_TOLERANCE_VOX)
-                    for label, com in coms.items()]
-    _draw_panel(axes[0], ct_slice, msk_slice, cmap, com_in_plane,
-                title=f"Sagittal  (R-slice {mid_r}/{msk_data.shape[2]})",
-                xlabel="← P-axis (posterior →)",
-                ylabel="← I-axis (inferior →)")
+    ct_win = _window(ct_data)
 
-    # Coronal: slice along P (axis 0), view (R, I) plane = (axis 2, axis 1)
-    ct_slice  = ct_display[mid_p, :, :]
-    msk_slice = msk_data  [mid_p, :, :]
-    com_in_plane = [(label, com[2], com[1],
-                     abs(com[0] - mid_p) < SLICE_TOLERANCE_VOX)
-                    for label, com in coms.items()]
-    _draw_panel(axes[1], ct_slice, msk_slice, cmap, com_in_plane,
-                title=f"Coronal  (P-slice {mid_p}/{msk_data.shape[0]})",
-                xlabel="← R-axis (right →)",
-                ylabel="← I-axis (inferior →)")
+    for row, (dim, plane_name) in enumerate(_PLANES):
+        idx = slice_by_dim[dim]
+        ct_slice  = _display_slice(_safe_slice(ct_win,   dim, idx), dim)
+        msk_slice = _display_slice(_safe_slice(msk_data, dim, idx), dim)
 
-    # Axial: slice along I (axis 1), view (P, R) plane = (axis 0, axis 2)
-    ct_slice  = ct_display[:, mid_i, :]
-    msk_slice = msk_data  [:, mid_i, :]
-    com_in_plane = [(label, com[0], com[2],
-                     abs(com[1] - mid_i) < SLICE_TOLERANCE_VOX)
-                    for label, com in coms.items()]
-    _draw_panel(axes[2], ct_slice, msk_slice, cmap, com_in_plane,
-                title=f"Axial  (I-slice {mid_i}/{msk_data.shape[1]})",
-                xlabel="← P-axis (posterior →)",
-                ylabel="← R-axis (right →)")
+        rgb_raw = np.stack([ct_slice, ct_slice, ct_slice], axis=-1)
+        rgb_ov  = _overlay(ct_slice, msk_slice, _VERSE_COLORS)
 
+        axes[row, 0].imshow(rgb_raw, aspect="auto", interpolation="nearest")
+        axes[row, 1].imshow(rgb_ov,  aspect="auto", interpolation="nearest")
+        _draw_centroid_markers(axes[row, 1], coms, dim, idx)
+
+        axes[row, 0].text(
+            -0.04, 0.5,
+            f"{plane_name}  {_PLANE_AXIS_NAMES[dim]}={idx}",
+            transform=axes[row, 0].transAxes,
+            fontsize=8, color="#aaaaaa",
+            rotation=90, va="center", ha="right",
+        )
+
+    source_format = meta.get("source_format", "?")
     fig.suptitle(
-        f"{series_id}   source={meta.get('source_format')}   "
-        f"shape={msk_data.shape}   "
-        f"spacing={tuple(round(s, 3) for s in spacing)}   "
-        f"labels={len(labels_present)}   "
-        f"orientation={meta.get('orientation', 'PIR')}",
-        fontsize=12, y=0.995,
+        f"{series_id}   shape={tuple(msk_data.shape)}   "
+        f"spacing=({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f}) mm   "
+        f"labels={len(labels_present)}   src={source_format}",
+        fontsize=11, color="#dddddd", y=0.997,
     )
-    fig.text(0.5, 0.02,
-             "Yellow ● : mask-derived vertebra center-of-mass.  "
-             "Mask colors: per-label (distinct).  "
-             "Image is canonical PIR.",
-             ha="center", fontsize=9, color="#444441")
 
-    plt.tight_layout(rect=[0, 0.04, 1, 0.97])
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(str(out_path), dpi=dpi, bbox_inches="tight", facecolor="white")
+    fig.savefig(str(out_path), dpi=dpi, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
     plt.close(fig)
 
     return {
         "series_id":     series_id,
-        "source_format": meta.get("source_format"),
+        "source_format": source_format,
         "n_labels":      len(labels_present),
         "shape":         list(msk_data.shape),
         "out_path":      str(out_path),
@@ -216,15 +238,14 @@ def render_scan(scan_dir: Path, out_path: Path,
 
 
 # =============================================================================
-# parallel orchestration
+# parallel orchestration  (unchanged from prior version)
 # =============================================================================
 
 def _render_one(args: tuple[str, str, int]) -> dict[str, Any]:
     scan_dir_str, out_dir_str, dpi = args
     scan_dir = Path(scan_dir_str)
-    out_dir  = Path(out_dir_str)
     series_id = scan_dir.name.replace("scan-", "")
-    out_path = out_dir / f"{series_id}.png"
+    out_path = Path(out_dir_str) / f"{series_id}.png"
     try:
         return render_scan(scan_dir, out_path, dpi=dpi)
     except Exception as e:
@@ -233,10 +254,8 @@ def _render_one(args: tuple[str, str, int]) -> dict[str, Any]:
 
 def _flush_logs() -> None:
     for h in log.handlers or logging.getLogger().handlers:
-        try:
-            h.flush()
-        except Exception:
-            pass
+        try:    h.flush()
+        except Exception: pass
 
 
 def render_many(scan_dirs: list[Path], out_dir: Path,
@@ -246,13 +265,12 @@ def render_many(scan_dirs: list[Path], out_dir: Path,
              len(scan_dirs), out_dir, workers, dpi)
     _flush_logs()
 
+    work_items = [(str(d), str(out_dir), dpi) for d in scan_dirs]
     results: list[dict[str, Any]] = []
     n_done = 0
     last_log_count = 0
     last_log_time = time.monotonic()
     start = last_log_time
-
-    work_items = [(str(d), str(out_dir), dpi) for d in scan_dirs]
 
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(_render_one, item): item for item in work_items}
@@ -262,27 +280,21 @@ def render_many(scan_dirs: list[Path], out_dir: Path,
             n_done += 1
             if "error" in r:
                 log.warning("  %s: %s", r["series_id"], r["error"])
-
-            since_count = n_done - last_log_count
-            since_time = time.monotonic() - last_log_time
-            if since_count >= 10 or since_time >= 10.0:
+            if n_done - last_log_count >= 10 or time.monotonic() - last_log_time >= 10.0:
                 elapsed = time.monotonic() - start
                 rate = n_done / elapsed if elapsed > 0 else 0.0
                 remaining = len(scan_dirs) - n_done
                 eta = remaining / rate if rate > 0 else 0.0
                 log.info("  progress: %d/%d (%.1f%%)  %.1f scans/s  ETA %ds",
                          n_done, len(scan_dirs),
-                         100 * n_done / len(scan_dirs),
-                         rate, int(eta))
+                         100 * n_done / len(scan_dirs), rate, int(eta))
                 _flush_logs()
                 last_log_count = n_done
                 last_log_time = time.monotonic()
 
     results.sort(key=lambda r: r["series_id"])
-
-    n_ok  = sum(1 for r in results if "error" not in r)
-    n_err = len(results) - n_ok
-    log.info("Render done: %d ok, %d failed", n_ok, n_err)
+    n_ok = sum(1 for r in results if "error" not in r)
+    log.info("Render done: %d ok, %d failed", n_ok, len(results) - n_ok)
     return results
 
 
@@ -293,49 +305,35 @@ def render_many(scan_dirs: list[Path], out_dir: Path,
 def _scans_to_render(args: argparse.Namespace) -> list[Path]:
     all_scans = sorted(d for d in args.input_dir.iterdir()
                        if d.is_dir() and d.name.startswith("scan-"))
-
     if args.scans:
         wanted = set(args.scans)
-        scans = [d for d in all_scans
-                 if d.name.replace("scan-", "") in wanted]
+        scans = [d for d in all_scans if d.name.replace("scan-", "") in wanted]
     elif args.flagged_from:
         manifest = json.loads(Path(args.flagged_from).read_text())
         flagged_ids = set()
         for status_group in ("WARN", "FAIL"):
             for entry in manifest.get("flagged_scans", {}).get(status_group, []):
                 flagged_ids.add(entry["series_id"])
-        scans = [d for d in all_scans
-                 if d.name.replace("scan-", "") in flagged_ids]
+        scans = [d for d in all_scans if d.name.replace("scan-", "") in flagged_ids]
         log.info("Found %d flagged scans in %s", len(scans), args.flagged_from)
     else:
         scans = all_scans
-
     if args.limit:
-        scans = scans[: args.limit]
-
+        scans = scans[:args.limit]
     return scans
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="verse-visualize",
-        description="Render per-scan QC PNGs for canonical (PIR) scans.",
-    )
-    p.add_argument("--input_dir", type=Path, required=True,
-                   help="Path to data/canonical/ (contains scan-* subdirs).")
-    p.add_argument("--out_dir", type=Path, required=True,
-                   help="Where to write PNG files.")
-    p.add_argument("--scans", nargs="*",
-                   help="Specific series IDs to render (default: all).")
-    p.add_argument("--flagged_from", type=Path,
-                   help="Render only scans flagged WARN/FAIL in this qc_manifest.json.")
-    p.add_argument("--limit", type=int,
-                   help="Cap the number of scans rendered.")
-    p.add_argument("--workers", type=int, default=4,
-                   help="ProcessPoolExecutor workers (default 4).")
-    p.add_argument("--dpi", type=int, default=DEFAULT_DPI,
-                   help="PNG dpi (default 80; 150 for paper figures).")
-    p.add_argument("--log_level", default="INFO",
+    p = argparse.ArgumentParser(prog="verse-visualize",
+                                description="Per-scan QC PNGs for canonical (PIR) VerSe scans.")
+    p.add_argument("--input_dir",  type=Path, required=True)
+    p.add_argument("--out_dir",    type=Path, required=True)
+    p.add_argument("--scans",      nargs="*")
+    p.add_argument("--flagged_from", type=Path)
+    p.add_argument("--limit",      type=int)
+    p.add_argument("--workers",    type=int, default=4)
+    p.add_argument("--dpi",        type=int, default=DEFAULT_DPI)
+    p.add_argument("--log_level",  default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
 
@@ -346,19 +344,14 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-
     if not args.input_dir.is_dir():
         log.error("input_dir not found: %s", args.input_dir)
         return 1
-
     scans = _scans_to_render(args)
     if not scans:
         log.error("No scans selected.")
         return 1
-
-    results = render_many(scans, args.out_dir,
-                          workers=args.workers, dpi=args.dpi)
-
+    results = render_many(scans, args.out_dir, workers=args.workers, dpi=args.dpi)
     index_path = args.out_dir / "renders_manifest.json"
     index_path.write_text(json.dumps({
         "n_rendered": sum(1 for r in results if "error" not in r),
