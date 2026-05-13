@@ -1,46 +1,21 @@
 """
-visualize.py — per-scan QC renders for the unified VerSeFusion corpus.
+visualize.py — per-scan QC renders for canonically reoriented scans.
 
-For each scan, generates a 3-panel PNG (sagittal, coronal, axial mid-slice) with:
+For each scan in data/canonical/scan-*/, generates a 3-panel PNG with:
   - CT in bone window, grayscale background
-  - Vertebra mask labels overlaid in distinct semi-transparent colors
-  - TUM-published centroid positions marked with red crosses, labeled by
-    vertebra number
-  - Actual mask center-of-mass marked with yellow dots, for visual comparison
+  - Mask labels overlaid in distinct semi-transparent colors
+  - Mask-derived center-of-mass markers (yellow dots, labeled by vertebra number)
 
-The centroid coordinate convention is dispatched per-source:
-  - MICCAI (no `direction` field): PIR-mm, divide by PIR spacing → PIR voxel
-  - BIDS  (`direction=["L","A","S"]`): voxel coords in the LAS-reoriented image,
-    which is the raw image's voxel grid → convert to PIR voxel via axis flip+permute
-
-This module is the visual companion to qc.py's centroid_alignment check.
-Where qc.py reports a numeric match rate, visualize.py shows you whether the
-centroids actually look right on the image.
+Inputs are already in PIR orientation (per the reorient stage), so this
+module loads the canonical NIfTIs and plots directly — no orientation
+handling needed.  Axis 0 = P, axis 1 = I, axis 2 = R.
 
 Usage
 -----
-    # Render a specific list of scans
-    python -m verse_pipeline.visualize \
-        --unified_dir data/unified \
-        --out_dir     data/qc/renders \
-        --scans gl003 verse014 verse512
-
-    # Render the first 10 scans (smoke test)
-    python -m verse_pipeline.visualize \
-        --unified_dir data/unified \
-        --out_dir     data/qc/renders \
-        --limit 10
-
-    # Render every scan that QC flagged (read from qc_manifest.json)
-    python -m verse_pipeline.visualize \
-        --unified_dir   data/unified \
-        --out_dir       data/qc/renders \
-        --flagged_from  data/qc/qc_manifest.json
-
-    # Render all 374
-    python -m verse_pipeline.visualize \
-        --unified_dir data/unified \
-        --out_dir     data/qc/renders
+    python -m verse_pipeline.visualize \\
+        --input_dir data/canonical \\
+        --out_dir   data/qc/renders \\
+        --limit     10
 """
 
 from __future__ import annotations
@@ -57,13 +32,9 @@ from typing import Any
 import numpy as np
 import nibabel as nib
 import matplotlib
-matplotlib.use("Agg")     # non-interactive backend for headless cluster runs
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from nibabel.orientations import (
-    axcodes2ornt, io_orientation, ornt_transform, apply_orientation,
-    inv_ornt_aff,
-)
 
 log = logging.getLogger("verse.visualize")
 
@@ -72,115 +43,11 @@ log = logging.getLogger("verse.visualize")
 # constants
 # =============================================================================
 
-# Bone-window CT display range (HU)
 CT_DISPLAY_MIN = -200
 CT_DISPLAY_MAX = 1500
 
-# Distance (in voxels) within which a centroid is plotted on a slice
 SLICE_TOLERANCE_VOX = 10
-
-# Render DPI — keeps PNGs lightweight for browsing
 DEFAULT_DPI = 80
-
-
-# =============================================================================
-# geometry helpers
-# =============================================================================
-
-def reorient_to_pir(img: "nib.Nifti1Image") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (data_pir, pir_affine, spacing_pir) — reoriented to PIR."""
-    data = np.asarray(img.dataobj)
-    target_ornt = axcodes2ornt(("P", "I", "R"))
-    current_ornt = io_orientation(img.affine)
-    xform = ornt_transform(current_ornt, target_ornt)
-    data_pir = apply_orientation(data, xform)
-    pir_affine = img.affine @ inv_ornt_aff(xform, data.shape)
-    spacing_pir = np.array([np.linalg.norm(pir_affine[:3, i]) for i in range(3)])
-    return data_pir, pir_affine, spacing_pir
-
-
-def load_centroids(ctd_path: Path) -> tuple[list[dict], list[str] | None]:
-    """Return (centroid_entries, direction_field_or_None)."""
-    if not ctd_path or not Path(ctd_path).exists():
-        return [], None
-    try:
-        with open(ctd_path) as f:
-            raw = json.load(f)
-    except Exception:
-        return [], None
-    if not isinstance(raw, list):
-        return [], None
-    direction = None
-    entries = []
-    for e in raw:
-        if not isinstance(e, dict):
-            continue
-        if "direction" in e and direction is None:
-            direction = e["direction"]
-            continue
-        if all(k in e for k in ("label", "X", "Y", "Z")):
-            entries.append({
-                "label": int(e["label"]),
-                "X": float(e["X"]),
-                "Y": float(e["Y"]),
-                "Z": float(e["Z"]),
-            })
-    return entries, direction
-
-
-def centroids_to_pir_voxel(
-    centroids: list[dict],
-    direction: list[str] | None,
-    pir_shape: tuple[int, int, int],
-    spacing_pir: np.ndarray,
-) -> list[dict]:
-    """Add a 'pir_voxel' field to each centroid entry, dispatching on source format.
-
-    MICCAI centroids (no direction field): PIR-mm, divide by PIR spacing.
-    BIDS centroids (direction=["L","A","S"]): voxel coords in the LAS-reoriented image,
-      which is the raw image's voxel grid for those subjects.  We convert to
-      PIR voxel via axis flip+permute.
-
-    The LAS → PIR mapping:
-      LAS axis 0 (L direction) ↔ PIR axis 2 (R direction), flipped
-      LAS axis 1 (A direction) ↔ PIR axis 0 (P direction), flipped
-      LAS axis 2 (S direction) ↔ PIR axis 1 (I direction), flipped
-
-    So given LAS voxel (X, Y, Z) and PIR shape (P, I, R):
-      pir_voxel_p = pir_shape[0] - 1 - LAS_Y
-      pir_voxel_i = pir_shape[1] - 1 - LAS_Z
-      pir_voxel_r = pir_shape[2] - 1 - LAS_X
-    """
-    out = []
-    for c in centroids:
-        if direction is None:
-            # MICCAI: PIR-mm
-            pir_voxel = (
-                c["X"] / spacing_pir[0],
-                c["Y"] / spacing_pir[1],
-                c["Z"] / spacing_pir[2],
-            )
-        else:
-            # BIDS LAS voxel → PIR voxel
-            pir_voxel = (
-                pir_shape[0] - 1 - c["Y"],
-                pir_shape[1] - 1 - c["Z"],
-                pir_shape[2] - 1 - c["X"],
-            )
-        out.append({**c, "pir_voxel": pir_voxel})
-    return out
-
-
-def label_centers_of_mass(msk_pir: np.ndarray, labels: list[int]) -> dict[int, tuple[float, float, float]]:
-    """Return {label: (p, i, r)} for each label present in the mask."""
-    out: dict[int, tuple[float, float, float]] = {}
-    for label in labels:
-        coords = np.argwhere(msk_pir == label)
-        if len(coords) == 0:
-            continue
-        com = coords.mean(axis=0)
-        out[label] = tuple(float(v) for v in com)
-    return out
 
 
 # =============================================================================
@@ -188,27 +55,35 @@ def label_centers_of_mass(msk_pir: np.ndarray, labels: list[int]) -> dict[int, t
 # =============================================================================
 
 def _make_label_cmap() -> mcolors.ListedColormap:
-    """Discrete colormap for VerSe labels 0-28 (0 = transparent background)."""
-    base = plt.get_cmap("tab20")(np.linspace(0, 1, 20))
+    base  = plt.get_cmap("tab20")(np.linspace(0, 1, 20))
     extra = plt.get_cmap("Set3")(np.linspace(0, 1, 12))
     colors = np.vstack([base, extra])[:29]
-    colors[0] = [0, 0, 0, 0]   # background transparent
+    colors[0] = [0, 0, 0, 0]
     return mcolors.ListedColormap(colors)
 
 
 def _bone_window(ct_data: np.ndarray) -> np.ndarray:
-    """Clip CT to bone window and normalize 0-1 for display."""
     clipped = np.clip(ct_data, CT_DISPLAY_MIN, CT_DISPLAY_MAX)
     return (clipped - CT_DISPLAY_MIN) / (CT_DISPLAY_MAX - CT_DISPLAY_MIN)
 
 
-def _best_slice_idx(msk_pir: np.ndarray, axis: int) -> int:
-    """Pick the slice index along `axis` with the most labeled voxels."""
-    if not np.any(msk_pir > 0):
-        return msk_pir.shape[axis] // 2
-    sum_axes = tuple(a for a in range(msk_pir.ndim) if a != axis)
-    profile = np.sum(msk_pir > 0, axis=sum_axes)
+def _best_slice_idx(msk_data: np.ndarray, axis: int) -> int:
+    if not np.any(msk_data > 0):
+        return msk_data.shape[axis] // 2
+    sum_axes = tuple(a for a in range(msk_data.ndim) if a != axis)
+    profile = np.sum(msk_data > 0, axis=sum_axes)
     return int(np.argmax(profile))
+
+
+def mask_centers_of_mass(msk_data: np.ndarray, labels: list[int]) -> dict[int, tuple[float, float, float]]:
+    out: dict[int, tuple[float, float, float]] = {}
+    for label in labels:
+        coords = np.argwhere(msk_data == label)
+        if len(coords) == 0:
+            continue
+        com = coords.mean(axis=0)
+        out[label] = tuple(float(v) for v in com)
+    return out
 
 
 def _draw_panel(
@@ -216,16 +91,14 @@ def _draw_panel(
     ct_slice: np.ndarray,
     msk_slice: np.ndarray,
     label_cmap: mcolors.ListedColormap,
-    centroids_in_plane: list[tuple[int, float, float, bool]],
-    com_in_plane: list[tuple[int, float, float]],
+    com_in_plane: list[tuple[int, float, float, bool]],
     title: str,
     xlabel: str,
     ylabel: str,
 ) -> None:
     """Draw one orthogonal panel.
 
-    centroids_in_plane: list of (label, x, y, in_slice_or_nearby_bool)
-    com_in_plane:       list of (label, x, y)  — actual mask CoM
+    com_in_plane: list of (label, screen_x, screen_y, in_or_near_slice_bool)
     """
     ax.imshow(ct_slice.T, cmap="gray", origin="lower", aspect="equal",
               vmin=0, vmax=1, interpolation="nearest")
@@ -233,21 +106,15 @@ def _draw_panel(
     ax.imshow(masked, cmap=label_cmap, alpha=0.45, origin="lower",
               aspect="equal", vmin=0, vmax=28, interpolation="nearest")
 
-    # Yellow dots: actual mask CoM
-    for label, x, y in com_in_plane:
-        ax.plot(x, y, marker="o", color="#FFD500", markersize=5,
-                markeredgecolor="black", markeredgewidth=0.5, linestyle="")
-
-    # Red crosses: TUM centroid; faded if not in this slice
-    for label, x, y, in_plane in centroids_in_plane:
+    for label, x, y, in_plane in com_in_plane:
         alpha = 1.0 if in_plane else 0.25
-        ax.plot(x, y, marker="+", color="#E24B4A", markersize=14,
-                markeredgewidth=2.0, alpha=alpha, linestyle="")
+        ax.plot(x, y, marker="o", color="#FFD500", markersize=6,
+                markeredgecolor="black", markeredgewidth=0.8,
+                alpha=alpha, linestyle="")
         if in_plane:
             ax.annotate(str(label), xy=(x, y), color="#FFFF80",
                         fontsize=8, weight="bold",
-                        xytext=(6, 6), textcoords="offset points",
-                        path_effects=[])
+                        xytext=(7, 7), textcoords="offset points")
 
     ax.set_title(title, fontsize=11)
     ax.set_xlabel(xlabel, fontsize=9)
@@ -257,7 +124,7 @@ def _draw_panel(
 
 def render_scan(scan_dir: Path, out_path: Path,
                 dpi: int = DEFAULT_DPI) -> dict[str, Any]:
-    """Render one scan; return small summary dict."""
+    """Render one canonical scan."""
     series_id = scan_dir.name.replace("scan-", "")
     meta_path = scan_dir / f"scan-{series_id}_meta.json"
     if not meta_path.exists():
@@ -266,91 +133,72 @@ def render_scan(scan_dir: Path, out_path: Path,
 
     ct_path  = Path(meta["source_paths"]["ct"])
     msk_path = Path(meta["source_paths"]["msk"])
-    ctd_path = meta["source_paths"].get("ctd")
 
     ct_img  = nib.load(str(ct_path))
     msk_img = nib.load(str(msk_path))
 
-    ct_pir,  _, _           = reorient_to_pir(ct_img)
-    msk_pir, _, spacing_pir = reorient_to_pir(msk_img)
-    ct_pir  = ct_pir.astype(np.float32)
-    msk_pir = msk_pir.astype(np.int32)
-    ct_display = _bone_window(ct_pir)
+    ct_data  = np.asarray(ct_img.dataobj).astype(np.float32)
+    msk_data = np.asarray(msk_img.dataobj).astype(np.int32)
 
-    centroids, direction = load_centroids(Path(ctd_path)) if ctd_path else ([], None)
-    centroids = centroids_to_pir_voxel(centroids, direction,
-                                       msk_pir.shape, spacing_pir)
-    coms = label_centers_of_mass(msk_pir, [c["label"] for c in centroids])
+    spacing = tuple(float(np.linalg.norm(ct_img.affine[:3, i])) for i in range(3))
+    ct_display = _bone_window(ct_data)
+
+    labels_present = sorted(int(l) for l in np.unique(msk_data) if l != 0)
+    coms = mask_centers_of_mass(msk_data, labels_present)
 
     cmap = _make_label_cmap()
 
-    # Three orthogonal slices — pick by max label coverage
-    mid_p = _best_slice_idx(msk_pir, axis=0)   # P axis → coronal-ish view
-    mid_i = _best_slice_idx(msk_pir, axis=1)   # I axis → axial view
-    mid_r = _best_slice_idx(msk_pir, axis=2)   # R axis → sagittal view
+    mid_p = _best_slice_idx(msk_data, axis=0)
+    mid_i = _best_slice_idx(msk_data, axis=1)
+    mid_r = _best_slice_idx(msk_data, axis=2)
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 7))
 
-    # --- Sagittal: slice along R, show (P, I) plane ---------------------------
+    # Sagittal: slice along R (axis 2), view (P, I) plane = (axis 0, axis 1)
     ct_slice  = ct_display[:, :, mid_r]
-    msk_slice = msk_pir   [:, :, mid_r]
-    ctd_in_plane = [(c["label"], c["pir_voxel"][0], c["pir_voxel"][1],
-                     abs(c["pir_voxel"][2] - mid_r) < SLICE_TOLERANCE_VOX)
-                    for c in centroids]
-    com_in_plane = [(label, com[0], com[1])
-                    for label, com in coms.items()
-                    if abs(com[2] - mid_r) < SLICE_TOLERANCE_VOX]
-    _draw_panel(axes[0], ct_slice, msk_slice, cmap,
-                ctd_in_plane, com_in_plane,
-                title=f"Sagittal  (R-slice {mid_r}/{msk_pir.shape[2]})",
+    msk_slice = msk_data  [:, :, mid_r]
+    com_in_plane = [(label, com[0], com[1],
+                     abs(com[2] - mid_r) < SLICE_TOLERANCE_VOX)
+                    for label, com in coms.items()]
+    _draw_panel(axes[0], ct_slice, msk_slice, cmap, com_in_plane,
+                title=f"Sagittal  (R-slice {mid_r}/{msk_data.shape[2]})",
                 xlabel="← P-axis (posterior →)",
                 ylabel="← I-axis (inferior →)")
 
-    # --- Coronal: slice along P, show (R, I) plane ----------------------------
+    # Coronal: slice along P (axis 0), view (R, I) plane = (axis 2, axis 1)
     ct_slice  = ct_display[mid_p, :, :]
-    msk_slice = msk_pir   [mid_p, :, :]
-    # Coronal axes: x is R, y is I.  But our slice is (I, R) — transpose in _draw_panel.
-    # The slice shape is (I_len, R_len) so transpose puts R on x, I on y. Centroids
-    # need (R, I) for plotting → use pir_voxel[2], pir_voxel[1].
-    ctd_in_plane = [(c["label"], c["pir_voxel"][2], c["pir_voxel"][1],
-                     abs(c["pir_voxel"][0] - mid_p) < SLICE_TOLERANCE_VOX)
-                    for c in centroids]
-    com_in_plane = [(label, com[2], com[1])
-                    for label, com in coms.items()
-                    if abs(com[0] - mid_p) < SLICE_TOLERANCE_VOX]
-    _draw_panel(axes[1], ct_slice, msk_slice, cmap,
-                ctd_in_plane, com_in_plane,
-                title=f"Coronal  (P-slice {mid_p}/{msk_pir.shape[0]})",
+    msk_slice = msk_data  [mid_p, :, :]
+    com_in_plane = [(label, com[2], com[1],
+                     abs(com[0] - mid_p) < SLICE_TOLERANCE_VOX)
+                    for label, com in coms.items()]
+    _draw_panel(axes[1], ct_slice, msk_slice, cmap, com_in_plane,
+                title=f"Coronal  (P-slice {mid_p}/{msk_data.shape[0]})",
                 xlabel="← R-axis (right →)",
                 ylabel="← I-axis (inferior →)")
 
-    # --- Axial: slice along I, show (P, R) plane -----------------------------
+    # Axial: slice along I (axis 1), view (P, R) plane = (axis 0, axis 2)
     ct_slice  = ct_display[:, mid_i, :]
-    msk_slice = msk_pir   [:, mid_i, :]
-    ctd_in_plane = [(c["label"], c["pir_voxel"][0], c["pir_voxel"][2],
-                     abs(c["pir_voxel"][1] - mid_i) < SLICE_TOLERANCE_VOX)
-                    for c in centroids]
-    com_in_plane = [(label, com[0], com[2])
-                    for label, com in coms.items()
-                    if abs(com[1] - mid_i) < SLICE_TOLERANCE_VOX]
-    _draw_panel(axes[2], ct_slice, msk_slice, cmap,
-                ctd_in_plane, com_in_plane,
-                title=f"Axial  (I-slice {mid_i}/{msk_pir.shape[1]})",
+    msk_slice = msk_data  [:, mid_i, :]
+    com_in_plane = [(label, com[0], com[2],
+                     abs(com[1] - mid_i) < SLICE_TOLERANCE_VOX)
+                    for label, com in coms.items()]
+    _draw_panel(axes[2], ct_slice, msk_slice, cmap, com_in_plane,
+                title=f"Axial  (I-slice {mid_i}/{msk_data.shape[1]})",
                 xlabel="← P-axis (posterior →)",
                 ylabel="← R-axis (right →)")
 
-    # Header with metadata, footer with legend
-    n_ctd = len(centroids)
     fig.suptitle(
         f"{series_id}   source={meta.get('source_format')}   "
-        f"shape={msk_pir.shape}   spacing={tuple(round(s, 3) for s in spacing_pir)}   "
-        f"centroids={n_ctd}",
+        f"shape={msk_data.shape}   "
+        f"spacing={tuple(round(s, 3) for s in spacing)}   "
+        f"labels={len(labels_present)}   "
+        f"orientation={meta.get('orientation', 'PIR')}",
         fontsize=12, y=0.995,
     )
     fig.text(0.5, 0.02,
-             "Red + : TUM-published centroid (labeled by vertebra number).  "
-             "Yellow ● : actual mask center-of-mass.  "
-             "Mask colors: per-label (random).",
+             "Yellow ● : mask-derived vertebra center-of-mass.  "
+             "Mask colors: per-label (distinct).  "
+             "Image is canonical PIR.",
              ha="center", fontsize=9, color="#444441")
 
     plt.tight_layout(rect=[0, 0.04, 1, 0.97])
@@ -359,11 +207,11 @@ def render_scan(scan_dir: Path, out_path: Path,
     plt.close(fig)
 
     return {
-        "series_id":    series_id,
+        "series_id":     series_id,
         "source_format": meta.get("source_format"),
-        "n_centroids": n_ctd,
-        "pir_shape":   list(msk_pir.shape),
-        "out_path":    str(out_path),
+        "n_labels":      len(labels_present),
+        "shape":         list(msk_data.shape),
+        "out_path":      str(out_path),
     }
 
 
@@ -372,7 +220,6 @@ def render_scan(scan_dir: Path, out_path: Path,
 # =============================================================================
 
 def _render_one(args: tuple[str, str, int]) -> dict[str, Any]:
-    """Worker entry point — takes string paths for pickle-friendliness."""
     scan_dir_str, out_dir_str, dpi = args
     scan_dir = Path(scan_dir_str)
     out_dir  = Path(out_dir_str)
@@ -433,7 +280,7 @@ def render_many(scan_dirs: list[Path], out_dir: Path,
 
     results.sort(key=lambda r: r["series_id"])
 
-    n_ok = sum(1 for r in results if "error" not in r)
+    n_ok  = sum(1 for r in results if "error" not in r)
     n_err = len(results) - n_ok
     log.info("Render done: %d ok, %d failed", n_ok, n_err)
     return results
@@ -444,8 +291,7 @@ def render_many(scan_dirs: list[Path], out_dir: Path,
 # =============================================================================
 
 def _scans_to_render(args: argparse.Namespace) -> list[Path]:
-    """Determine which scan-dirs to render based on CLI args."""
-    all_scans = sorted(d for d in args.unified_dir.iterdir()
+    all_scans = sorted(d for d in args.input_dir.iterdir()
                        if d.is_dir() and d.name.startswith("scan-"))
 
     if args.scans:
@@ -473,10 +319,10 @@ def _scans_to_render(args: argparse.Namespace) -> list[Path]:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="verse-visualize",
-        description="Render per-scan QC PNGs for the unified VerSe corpus.",
+        description="Render per-scan QC PNGs for canonical (PIR) scans.",
     )
-    p.add_argument("--unified_dir", type=Path, required=True,
-                   help="Path to data/unified/ (contains scan-* subdirs).")
+    p.add_argument("--input_dir", type=Path, required=True,
+                   help="Path to data/canonical/ (contains scan-* subdirs).")
     p.add_argument("--out_dir", type=Path, required=True,
                    help="Where to write PNG files.")
     p.add_argument("--scans", nargs="*",
@@ -488,7 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=4,
                    help="ProcessPoolExecutor workers (default 4).")
     p.add_argument("--dpi", type=int, default=DEFAULT_DPI,
-                   help="PNG dpi (default 80; bump to 150 for paper figures).")
+                   help="PNG dpi (default 80; 150 for paper figures).")
     p.add_argument("--log_level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -501,19 +347,18 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    if not args.unified_dir.is_dir():
-        log.error("unified_dir not found: %s", args.unified_dir)
+    if not args.input_dir.is_dir():
+        log.error("input_dir not found: %s", args.input_dir)
         return 1
 
     scans = _scans_to_render(args)
     if not scans:
-        log.error("No scans selected. Check --scans / --flagged_from / --unified_dir.")
+        log.error("No scans selected.")
         return 1
 
     results = render_many(scans, args.out_dir,
                           workers=args.workers, dpi=args.dpi)
 
-    # Write a small index manifest alongside the PNGs
     index_path = args.out_dir / "renders_manifest.json"
     index_path.write_text(json.dumps({
         "n_rendered": sum(1 for r in results if "error" not in r),

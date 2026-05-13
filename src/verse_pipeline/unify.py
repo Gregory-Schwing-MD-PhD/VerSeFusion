@@ -6,7 +6,7 @@ Input layout (post-download):
         ├── (folders from OSF, MICCAI-flat or BIDS-nested)
         │   ├── verse014.nii.gz
         │   ├── verse014_seg.nii.gz
-        │   ├── verse014_ctd.json
+        │   ├── verse014_ctd.json    (downloaded, but not materialized — see note)
         │   └── ...
     data/raw/verse20/
         ├── ...
@@ -17,7 +17,6 @@ Output layout (data/unified/):
     ├── scan-verse014/
     │   ├── scan-verse014_ct.nii.gz       -> symlink to raw file
     │   ├── scan-verse014_msk.nii.gz      -> symlink
-    │   ├── scan-verse014_ctd.json        -> symlink
     │   ├── scan-verse014_snp.png         -> symlink
     │   └── scan-verse014_meta.json       (generated)
     ├── scan-verse090/                    (scan 1 of patient verse400)
@@ -31,23 +30,26 @@ The meta.json captures:
   - split (training / validation / test, derived from raw path)
   - position ("1 of 2", etc.)
   - sex, age (from TUM demographics)
-  - source_paths (kind -> raw filesystem path)
+  - source_paths (kind -> raw filesystem path; only ct/msk/snp)
   - source_format ("miccai" or "bids", from filename style)
-  - centroid_coord_system (always "voxel" — see note below)
 
-A note on coordinate systems
-----------------------------
-TUM ships centroids as direct (X, Y, Z) array indices in the image's own
-voxel grid, across BOTH the MICCAI-challenge and BIDS distributions
-(empirically verified across all 374 scans of the unified corpus).
+A note on centroid files
+------------------------
+TUM ships a *_ctd.json centroid file per scan, but after substantial empirical
+investigation we determined the X/Y/Z values use INCONSISTENT coordinate
+conventions across the corpus (PIR-mm in some, image-array-axis-mm in others,
+yet another convention for the Glocker subset, etc.).  Without a per-scan
+calibration anchor, there's no robust way to interpret these values for
+downstream use.
 
-Some BIDS files carry an explicit ``direction`` field
-(e.g. ``["L", "A", "S"]``) documenting the anatomical orientation of the
-image axes — but it affects only interpretation, not indexing.
+We therefore:
+  - DOWNLOAD the centroid files (they live in data/raw/ alongside the CT and mask)
+  - DO NOT materialize them in data/unified/ — downstream stages compute
+    per-vertebra centroids fresh from the segmentation mask
+  - Document this in the README's Limitations section
 
-The ``centroid_coord_system`` field in meta.json is retained for forward
-compatibility but is currently always ``"voxel"``.  Downstream stages
-(reorient, veridah) use centroids as direct array indices.
+The data/raw/ tree remains the complete upstream snapshot; data/unified/ is
+the focused "what we use" view.
 """
 
 from __future__ import annotations
@@ -70,24 +72,29 @@ from verse_pipeline.utils.miccai import (
 
 log = logging.getLogger("verse.unify")
 
+# Which kinds get materialized into data/unified/.  The miccai parser still
+# recognises and downloads ctd files; they just don't get symlinked here.
+# See module docstring for why centroids are dropped.
+MATERIALIZE_KINDS: tuple[str, ...] = ("ct", "msk", "snp")
+
+# Among the materialized kinds, which are required for a scan to be "complete"?
+REQUIRED_KINDS: tuple[str, ...] = ("ct", "msk")
+
 # When a scan appears in both v19 and v20, which release's copy wins?
 PREFERRED_RELEASE = "verse20"
 
-# Determines the canonical split tag from the OSF directory name.
 SPLIT_PATTERNS: tuple[tuple[str, str], ...] = (
     ("train", "training"),
     ("valid", "validation"),
     ("test",  "test"),
 )
 
-# Progress-logging cadence.
 DISCOVER_PROGRESS_EVERY_N_FILES = 500
 MATERIALISE_PROGRESS_EVERY_N_SCANS = 25
 PROGRESS_TIME_INTERVAL_SECONDS = 10.0
 
 
 def _flush_logs() -> None:
-    """Force-flush log handlers so SLURM .err files show output promptly."""
     for h in log.handlers or logging.getLogger().handlers:
         try:
             h.flush()
@@ -108,14 +115,14 @@ class RawScan:
     files:     dict[str, MICCAIFile] = field(default_factory=dict)
 
     def is_complete(self) -> bool:
-        return all(k in self.files for k in required_kinds())
+        """A scan is complete if it has both CT and mask (ctd is no longer required)."""
+        return all(k in self.files for k in REQUIRED_KINDS)
 
-    def missing_kinds(self) -> list[str]:
-        return [k for k in required_kinds() if k not in self.files]
+    def missing_required_kinds(self) -> list[str]:
+        return [k for k in REQUIRED_KINDS if k not in self.files]
 
 
 def _split_for_path(path: Path) -> str:
-    """Infer the train/valid/test split from a path component."""
     for part in path.parts:
         lower = part.lower()
         for needle, canonical in SPLIT_PATTERNS:
@@ -125,11 +132,7 @@ def _split_for_path(path: Path) -> str:
 
 
 def discover_raw(raw_root: Path) -> dict[tuple[str, str], RawScan]:
-    """Walk raw_root recursively, grouping recognised files by (release, series_id).
-
-    Logs progress every DISCOVER_PROGRESS_EVERY_N_FILES files or every
-    PROGRESS_TIME_INTERVAL_SECONDS seconds, whichever comes first.
-    """
+    """Walk raw_root recursively, grouping recognised files by (release, series_id)."""
     out: dict[tuple[str, str], RawScan] = {}
     if not raw_root.is_dir():
         log.error("Raw dir not found: %s", raw_root)
@@ -178,7 +181,8 @@ def discover_raw(raw_root: Path) -> dict[tuple[str, str], RawScan]:
             if (since_count >= DISCOVER_PROGRESS_EVERY_N_FILES
                     or since_time >= PROGRESS_TIME_INTERVAL_SECONDS):
                 n_scans_so_far = sum(1 for (r, _) in out if r == release)
-                rate = n_files_seen / (time.monotonic() - start) if (time.monotonic() - start) > 0 else 0.0
+                rate = (n_files_seen / (time.monotonic() - start)
+                        if (time.monotonic() - start) > 0 else 0.0)
                 log.info("  [%s] %d files seen, %d parsed, %d scans grouped (%.0f files/s)",
                          release, n_files_seen, n_parsed, n_scans_so_far, rate)
                 _flush_logs()
@@ -214,11 +218,10 @@ class UnifiedScan:
     missing_kinds:          list[str]
     out_dir:                Path
     source_format:          str
-    centroid_coord_system:  str
 
 
 def _detect_source_format(source_paths: dict[str, str]) -> str:
-    """Return 'bids' if any file's name carries BIDS markers, else 'miccai'."""
+    """Return 'bids' if any materialized file's name carries BIDS markers, else 'miccai'."""
     for path in source_paths.values():
         name = Path(path).name
         if name.startswith("sub-") or "_dir-" in name:
@@ -258,19 +261,17 @@ def materialise_scan(
     others_releases: list[str],
     out_root: Path,
 ) -> UnifiedScan:
-    """Create out_root/scan-<series_id>/ with symlinks + meta.json.
-
-    Uses .absolute() (no FS access) instead of .resolve() (which does a stat
-    on every path component and is slow on distributed filesystems).
-    """
+    """Create out_root/scan-<series_id>/ with symlinks + meta.json."""
     scan_dir = out_root / f"scan-{raw.series_id}"
     scan_dir.mkdir(parents=True, exist_ok=True)
 
-    ext_map = {"ct":  "ct.nii.gz",  "msk": "msk.nii.gz",
-               "ctd": "ctd.json",   "snp": "snp.png"}
+    ext_map = {"ct": "ct.nii.gz", "msk": "msk.nii.gz", "snp": "snp.png"}
 
     source_paths: dict[str, str] = {}
-    for kind, src in raw.files.items():
+    for kind in MATERIALIZE_KINDS:
+        if kind not in raw.files:
+            continue
+        src = raw.files[kind]
         dst_name = f"scan-{raw.series_id}_{ext_map[kind]}"
         dst = scan_dir / dst_name
         if dst.exists() or dst.is_symlink():
@@ -280,24 +281,23 @@ def materialise_scan(
         source_paths[kind] = str(src_abs)
 
     source_format = _detect_source_format(source_paths)
-    centroid_coord_system = "voxel"   # TUM ships centroids as direct array indices
+    missing = raw.missing_required_kinds()
 
     meta = {
-        "series_id":             raw.series_id,
-        "patient_id":            demo.patient_id,
-        "chosen_release":        raw.release,
-        "other_releases":        others_releases,
-        "split":                 raw.split,
-        "position":              demo.position,
-        "in_v19":                demo.in_v19,
-        "in_v20":                demo.in_v20,
-        "sex":                   demo.sex,
-        "age":                   demo.age,
-        "source_paths":          source_paths,
-        "missing_kinds":         raw.missing_kinds(),
-        "source_format":         source_format,
-        "centroid_coord_system": centroid_coord_system,
-        "version":               "0.3.0",
+        "series_id":      raw.series_id,
+        "patient_id":     demo.patient_id,
+        "chosen_release": raw.release,
+        "other_releases": others_releases,
+        "split":          raw.split,
+        "position":       demo.position,
+        "in_v19":         demo.in_v19,
+        "in_v20":         demo.in_v20,
+        "sex":            demo.sex,
+        "age":            demo.age,
+        "source_paths":   source_paths,
+        "missing_kinds":  missing,
+        "source_format":  source_format,
+        "version":        "0.4.0",
     }
     meta_path = scan_dir / f"scan-{raw.series_id}_meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
@@ -314,10 +314,9 @@ def materialise_scan(
         in_v19=demo.in_v19,
         in_v20=demo.in_v20,
         source_paths=source_paths,
-        missing_kinds=raw.missing_kinds(),
+        missing_kinds=missing,
         out_dir=scan_dir,
         source_format=source_format,
-        centroid_coord_system=centroid_coord_system,
     )
 
 
@@ -326,7 +325,7 @@ def unify(
     out_root: Path,
     demographics_path: Path,
 ) -> list[UnifiedScan]:
-    """Top-level unify: discover raw, walk demographics, materialise per-scan dirs."""
+    """Top-level unify."""
     out_root.mkdir(parents=True, exist_ok=True)
 
     demographics = load_demographics(demographics_path)
@@ -417,7 +416,7 @@ def write_unify_manifest(unified: list[UnifiedScan], out_root: Path) -> Path:
         m = set(s.missing_kinds)
         if not m:
             n_complete += 1
-        elif m == {"msk", "ctd"} or m == {"msk", "ctd", "snp"}:
+        elif m == {"msk"}:
             n_image_only += 1
         elif m == {"ct"}:
             n_msk_only += 1
@@ -427,9 +426,11 @@ def write_unify_manifest(unified: list[UnifiedScan], out_root: Path) -> Path:
     multi_patients = {p: scans for p, scans in by_patient.items() if len(scans) > 1}
 
     manifest = {
-        "version":              "0.3.0",
+        "version":              "0.4.0",
         "source_format":        "miccai_with_bids_fallback",
         "preferred_release":    PREFERRED_RELEASE,
+        "materialize_kinds":    list(MATERIALIZE_KINDS),
+        "required_kinds":       list(REQUIRED_KINDS),
         "n_scans":              len(unified),
         "n_patients":           len(by_patient),
         "n_multi_series":       len(multi_patients),
@@ -445,21 +446,20 @@ def write_unify_manifest(unified: list[UnifiedScan], out_root: Path) -> Path:
         "multi_series_patients": multi_patients,
         "scans": [
             {
-                "series_id":             s.series_id,
-                "patient_id":            s.patient_id,
-                "chosen_release":        s.chosen_release,
-                "other_releases":        s.other_releases,
-                "split":                 s.split,
-                "position":              s.position,
-                "in_v19":                s.in_v19,
-                "in_v20":                s.in_v20,
-                "sex":                   s.sex,
-                "age":                   s.age,
-                "missing_kinds":         s.missing_kinds,
-                "source_paths":          s.source_paths,
-                "out_dir":               str(s.out_dir),
-                "source_format":         s.source_format,
-                "centroid_coord_system": s.centroid_coord_system,
+                "series_id":      s.series_id,
+                "patient_id":     s.patient_id,
+                "chosen_release": s.chosen_release,
+                "other_releases": s.other_releases,
+                "split":          s.split,
+                "position":       s.position,
+                "in_v19":         s.in_v19,
+                "in_v20":         s.in_v20,
+                "sex":            s.sex,
+                "age":            s.age,
+                "missing_kinds":  s.missing_kinds,
+                "source_paths":   s.source_paths,
+                "out_dir":        str(s.out_dir),
+                "source_format":  s.source_format,
             }
             for s in unified
         ],
@@ -479,7 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Unify MICCAI-format VerSe downloads into per-scan canonical "
             "directories.  Each scan becomes data/unified/scan-<series_id>/ "
-            "with symlinks to raw files plus a meta.json."
+            "with symlinks to raw CT/mask/snapshot files plus a meta.json."
         ),
     )
     p.add_argument("--raw_dir", type=Path, required=True,

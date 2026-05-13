@@ -1,55 +1,28 @@
 """
-qc.py — Per-scan alignment audit for VerSeFusion's unified corpus.
+qc.py — Per-scan QC audit for canonically reoriented VerSeFusion scans.
 
-ARCHITECTURE
-------------
-Patient-level identity is already certain after unify (every scan-dir knows its
-demographics-driven patient_id).  This module's only job is to verify that the
-CT, mask, and centroid files that unify grouped together actually agree
-geometrically — same world coordinate frame, same voxel grid, mask labels
-falling inside the CT volume, centroids landing on the right mask labels.
+Runs on the output of reorient.py (data/canonical/scan-*/).  All inputs are
+in PIR orientation, which lets us hardcode anatomical assumptions:
+  - axis 0 = P direction (toward back)
+  - axis 1 = I direction (toward feet) — VERTEBRAE STACK ALONG THIS AXIS
+  - axis 2 = R direction (toward right side)
 
-ALL CHECKS ARE PER-SCAN AND LOCAL.  We never compare one scan against another.
-This is a pure auditability stage, not a correction stage.
-
-Centroid coordinate system
---------------------------
-After empirical verification across all 374 scans of the unified corpus,
-TUM ships centroids as direct (X, Y, Z) array indices in the image's own
-voxel grid, in BOTH the MICCAI-challenge and BIDS distributions.  Some
-BIDS files carry an explicit ``direction`` field (e.g. ``["L", "A", "S"]``)
-documenting the anatomical orientation of the axes — but that affects only
-interpretation, not indexing.  X/Y/Z map directly to image array axes 0/1/2.
-
-(The earlier "asl_iso_1mm" coordinate-system flag in unify's meta.json was
-based on a misread of TUM's documentation; centroids are always in
-image-voxel space.)
+ALL CHECKS ARE PER-SCAN AND LOCAL.  This is a pure auditability stage.
 
 Checks performed
 ----------------
-Tier 1 — Header-only (cheap, no full volume load):
-  1. files_present     — required CT, mask, centroid present on disk
+Tier 1 — Header-only:
+  1. files_present     — required CT, mask present on disk
   2. headers_readable  — nibabel can load each NIfTI header
   3. shape_match       — CT.shape == mask.shape
   4. affine_match      — CT and mask affines agree on direction + spacing
+  5. orientation_pir   — both images report PIR orientation in their affines
 
-Tier 2 — Mask data (loads mask voxels, not CT):
-  5. label_inventory   — which VerSe labels (1-28) are present, voxel counts
-  6. label_in_range    — no labels outside VerSe's documented 1-28 scheme
-  7. labels_nonempty   — every label has at least MIN_LABEL_VOXELS
-
-Tier 3 — Centroid-mask alignment (if centroid present):
-  8. centroid_alignment — for each centroid (label, X, Y, Z):
-                          - rounds (X, Y, Z) to nearest int → (i, j, k)
-                          - checks (i, j, k) is in mask bounds
-                          - checks mask[i, j, k] == label
-
-Each check produces:
-  status:  one of CheckStatus.PASS / WARN / FAIL / SKIP
-  reasons: human-readable strings explaining what we found
-
-A per-scan overall status is computed by aggregating the worst individual
-status.  The manifest can be queried by jq to find every flagged scan.
+Tier 2 — Mask data:
+  6. label_inventory   — labels fall in VerSe range [1, 28], no tiny artifacts
+  7. label_continuity  — label CoMs are monotonic along axis 1 (I direction):
+                         label 1 (C1) is most superior (lowest axis-1 voxel),
+                         label 24+ (lumbar/sacrum) is most inferior (highest)
 
 Output
 ------
@@ -83,7 +56,6 @@ class CheckStatus:
     FAIL = "FAIL"
     SKIP = "SKIP"
 
-# Aggregation precedence (worst wins).  PASS < SKIP < WARN < FAIL.
 STATUS_RANK = {
     CheckStatus.PASS: 0,
     CheckStatus.SKIP: 1,
@@ -91,17 +63,20 @@ STATUS_RANK = {
     CheckStatus.FAIL: 3,
 }
 
-# Affine-match tolerances (inherited from series_assigner.py).
 DIR_TOLERANCE = 1e-3
-SPC_TOLERANCE = 0.01     # mm
+SPC_TOLERANCE = 0.01    # mm
 
-# VerSe label scheme: 1-7 cervical, 8-19 thoracic T1-T12, 20-25 lumbar L1-L6,
-# 26 sacrum, 27 coccyx, 28 T13.
 VERSE_LABEL_RANGE = (1, 28)
+MIN_LABEL_VOXELS  = 50
 
-# Labels with fewer than this many voxels are flagged as suspicious — most
-# likely annotation artifacts or single-slice noise.
-MIN_LABEL_VOXELS = 50
+# After PIR reorientation, axis 1 = I direction = head-to-foot.
+# VerSe labels increase from C1 (top, most superior) downward; increasing
+# axis 1 voxel index = more inferior.  Therefore label CoMs should
+# monotonically INCREASE in axis 1 as label number increases.
+SPINE_AXIS = 1
+EXPECTED_DIRECTION = "ascending"
+
+MAX_LABEL_INVERSIONS = 1
 
 
 # =============================================================================
@@ -110,7 +85,6 @@ MIN_LABEL_VOXELS = 50
 
 @dataclass
 class CheckResult:
-    """One named check's outcome for one scan."""
     status:  str = CheckStatus.PASS
     reasons: list[str] = field(default_factory=list)
     extra:   dict[str, Any] = field(default_factory=dict)
@@ -124,7 +98,6 @@ class CheckResult:
 
 @dataclass
 class ScanReport:
-    """Per-scan QC summary."""
     series_id:     str
     patient_id:    str
     source_format: str
@@ -149,12 +122,11 @@ class ScanReport:
 
 
 # =============================================================================
-# geometry helpers (adapted from CTSpinoPelvic1K's series_assigner)
+# geometry helpers
 # =============================================================================
 
 def _directions_match(d1: np.ndarray, d2: np.ndarray,
                       tol: float = DIR_TOLERANCE) -> tuple[bool, list[str]]:
-    """Compare two 3x3 direction matrices by per-axis dot product."""
     reasons: list[str] = []
     ok = True
     for i in range(3):
@@ -166,7 +138,6 @@ def _directions_match(d1: np.ndarray, d2: np.ndarray,
 
 
 def _decompose_affine(affine: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Split a 4x4 affine into (direction-3x3, spacing-3-vector)."""
     m = affine[:3, :3]
     spacing = np.array([np.linalg.norm(m[:, i]) for i in range(3)])
     if np.any(spacing < 1e-9):
@@ -175,32 +146,48 @@ def _decompose_affine(affine: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return direction, spacing
 
 
+def _affine_orientation_codes(affine: np.ndarray) -> tuple[str, str, str]:
+    """Determine which anatomical direction each array axis points to.
+
+    Returns a 3-tuple like ('P', 'I', 'R') indicating the dominant world
+    direction for each array axis.
+    """
+    from nibabel.orientations import io_orientation
+    ornt = io_orientation(affine)
+    # ornt is (3, 2): row i = [source_axis, flip].  The OUTPUT here is which
+    # RAS axis each array axis maps to.  But we want PIR-style codes.
+    # io_orientation actually returns mapping of array_axis -> RAS_axis,
+    # so we read it directly.
+    ras_axis_codes = ["R", "A", "S"]
+    flipped_codes  = ["L", "P", "I"]
+    codes = []
+    for source_axis, flip in ornt:
+        idx = int(source_axis)
+        if flip > 0:
+            codes.append(ras_axis_codes[idx])
+        else:
+            codes.append(flipped_codes[idx])
+    return tuple(codes)
+
+
 # =============================================================================
 # individual checks
 # =============================================================================
 
 def check_files_present(meta: dict[str, Any]) -> CheckResult:
     paths = meta.get("source_paths", {})
-    missing = []
-    for kind in ("ct", "msk", "ctd"):
-        p = paths.get(kind)
-        if not p or not Path(p).exists():
-            missing.append(kind)
-    if not missing:
-        return CheckResult(status=CheckStatus.PASS,
-                           reasons=["all required source files present on disk"])
-    if missing == ["ctd"]:
-        return CheckResult(status=CheckStatus.WARN,
-                           reasons=["missing centroid file (downstream centroid-based "
-                                    "checks will be skipped)"])
-    return CheckResult(status=CheckStatus.FAIL,
-                       reasons=[f"missing required source file(s): {missing}"])
+    missing_required = [k for k in ("ct", "msk")
+                        if not paths.get(k) or not Path(paths[k]).exists()]
+    if missing_required:
+        return CheckResult(status=CheckStatus.FAIL,
+                           reasons=[f"missing required source file(s): {missing_required}"])
+    return CheckResult(status=CheckStatus.PASS,
+                       reasons=["CT and mask present on disk"])
 
 
 def check_headers_readable(ct_path: Path, msk_path: Path) -> tuple[CheckResult, dict]:
-    """Try to load both headers.  Returns (result, info_dict_for_downstream)."""
     import nibabel as nib
-    info = {}
+    info: dict = {}
     try:
         ct_img = nib.load(str(ct_path))
         info["ct_shape"]  = tuple(int(s) for s in ct_img.shape)
@@ -260,26 +247,46 @@ def check_affine_match(info: dict) -> CheckResult:
                        f"(CT={ct_spc.tolist()}, mask={mk_spc.tolist()})")
     else:
         ok = False
-        reasons.append(f"spacing differs by {spc_diff:.4f}mm > {SPC_TOLERANCE}mm "
-                       f"(CT={ct_spc.tolist()}, mask={mk_spc.tolist()})")
+        reasons.append(f"spacing differs by {spc_diff:.4f}mm > {SPC_TOLERANCE}mm")
 
     origin_diff = np.abs(ct_aff[:3, 3] - mk_aff[:3, 3]).max()
     if origin_diff < 0.5:
         reasons.append(f"origins agree (diff={origin_diff:.4f}mm)")
     elif origin_diff < 5.0:
-        reasons.append(f"WARN: origins differ by {origin_diff:.4f}mm "
-                       f"(under 5mm — likely acceptable rounding)")
+        reasons.append(f"WARN: origins differ by {origin_diff:.4f}mm (acceptable)")
     else:
         ok = False
         reasons.append(f"origins differ by {origin_diff:.4f}mm > 5mm")
 
-    if ok:
-        return CheckResult(status=CheckStatus.PASS, reasons=reasons)
-    return CheckResult(status=CheckStatus.FAIL, reasons=reasons)
+    return CheckResult(status=CheckStatus.PASS if ok else CheckStatus.FAIL,
+                       reasons=reasons)
+
+
+def check_orientation_pir(info: dict) -> CheckResult:
+    """Verify the CT affine reports PIR orientation.  This is the cornerstone
+    check after reorient; everything downstream assumes PIR.
+    """
+    ct_aff = info.get("ct_affine")
+    if ct_aff is None:
+        return CheckResult(status=CheckStatus.SKIP, reasons=["CT header not loaded"])
+    try:
+        codes = _affine_orientation_codes(ct_aff)
+    except Exception as e:
+        return CheckResult(status=CheckStatus.FAIL,
+                           reasons=[f"could not derive orientation: {type(e).__name__}: {e}"])
+
+    expected = ("P", "I", "R")
+    extra = {"orientation_codes": list(codes), "expected": list(expected)}
+    if codes == expected:
+        return CheckResult(status=CheckStatus.PASS,
+                           reasons=[f"orientation = {''.join(codes)}"],
+                           extra=extra)
+    return CheckResult(status=CheckStatus.FAIL,
+                       reasons=[f"orientation = {''.join(codes)}, expected {''.join(expected)}"],
+                       extra=extra)
 
 
 def check_label_inventory(info: dict) -> CheckResult:
-    """Load mask data, inventory labels, check range and minimum sizes."""
     msk_img = info.get("msk_img")
     if msk_img is None:
         return CheckResult(status=CheckStatus.SKIP, reasons=["mask not loaded"])
@@ -311,129 +318,85 @@ def check_label_inventory(info: dict) -> CheckResult:
     extra = {"labels": sorted(label_counts), "label_voxel_counts": label_counts}
 
     if out_of_range:
-        reasons.append(f"FAIL: {len(out_of_range)} labels outside VerSe range "
-                       f"[1, 28]: {out_of_range}")
+        reasons.append(f"FAIL: {len(out_of_range)} labels outside VerSe range [1, 28]: {out_of_range}")
         return CheckResult(status=CheckStatus.FAIL, reasons=reasons, extra=extra)
 
     if tiny:
-        reasons.append(f"WARN: {len(tiny)} labels have fewer than {MIN_LABEL_VOXELS} "
-                       f"voxels (possible artifacts): {tiny}")
+        reasons.append(f"WARN: {len(tiny)} labels have < {MIN_LABEL_VOXELS} voxels: {tiny}")
         return CheckResult(status=CheckStatus.WARN, reasons=reasons, extra=extra)
 
     return CheckResult(status=CheckStatus.PASS, reasons=reasons, extra=extra)
 
 
-def check_centroid_alignment(meta: dict[str, Any], info: dict) -> CheckResult:
-    """For each labeled centroid, verify mask[i, j, k] == label.
+def check_label_continuity(info: dict) -> CheckResult:
+    """Verify per-label CoMs are monotonic along the I axis (axis 1 in PIR).
 
-    TUM ships centroid (X, Y, Z) as direct array indices in the image's own
-    voxel grid, across both MICCAI and BIDS distributions.  We round to the
-    nearest integer, bounds-check, and look up the mask label at that voxel.
-
-    Some files carry a ``direction`` field as the first JSON entry
-    (e.g. {"direction": ["L", "A", "S"]}).  This documents the anatomical
-    orientation of the axes but doesn't affect indexing.  We record it for
-    audit but otherwise pass through.
+    Since axis 1 is the inferior direction and VerSe labels increase
+    caudally (C1=1 most superior, L6/sacrum highest), CoM[axis 1] should
+    increase monotonically with label number.
     """
-    ctd_path = meta.get("source_paths", {}).get("ctd")
-    if not ctd_path or not Path(ctd_path).exists():
-        return CheckResult(status=CheckStatus.SKIP,
-                           reasons=["no centroid file (or unreadable) — alignment check skipped"])
-
     msk_data = info.get("msk_data")
     if msk_data is None:
+        return CheckResult(status=CheckStatus.SKIP, reasons=["mask data not loaded"])
+
+    label_voxel_counts: dict[int, int] = info.get("label_voxel_counts") or {}
+    labels_present = sorted(l for l in label_voxel_counts if l > 0)
+    if len(labels_present) < 2:
         return CheckResult(status=CheckStatus.SKIP,
-                           reasons=["mask data not loaded — alignment check skipped"])
+                           reasons=[f"only {len(labels_present)} label(s) present"])
 
-    try:
-        with open(ctd_path) as f:
-            centroids_raw = json.load(f)
-    except Exception as e:
-        return CheckResult(status=CheckStatus.FAIL,
-                           reasons=[f"failed to parse centroid JSON: {type(e).__name__}: {e}"])
+    coms: dict[int, tuple[float, float, float]] = {}
+    for label in labels_present:
+        coords = np.argwhere(msk_data == label)
+        if len(coords) > 0:
+            com = coords.mean(axis=0)
+            coms[label] = tuple(float(v) for v in com)
 
-    # The JSON is a list whose first entry may be a {"direction": [...]} header
-    # and the rest are per-vertebra centroids {"label": int, "X","Y","Z": float}.
-    direction = None
-    centroid_entries = []
-    for entry in centroids_raw if isinstance(centroids_raw, list) else []:
-        if not isinstance(entry, dict):
-            continue
-        if "direction" in entry and direction is None:
-            direction = entry["direction"]
-            continue
-        if all(k in entry for k in ("label", "X", "Y", "Z")):
-            centroid_entries.append(entry)
+    # Axis spreads (for diagnostic — we expect spine to be axis 1)
+    com_array = np.array(list(coms.values()))
+    spreads = com_array.ptp(axis=0)
+    dominant_axis = int(np.argmax(spreads))
 
-    if not centroid_entries:
-        return CheckResult(status=CheckStatus.WARN,
-                           reasons=[f"centroid JSON has no label/X/Y/Z entries"])
+    sorted_labels = sorted(coms)
+    axis_positions = [coms[l][SPINE_AXIS] for l in sorted_labels]
+    diffs = np.diff(axis_positions)
 
-    shape = msk_data.shape
-    matched = 0
-    label_mismatch: list[dict] = []
-    out_of_bounds: list[dict] = []
-    label_missing_in_mask: list[int] = []
+    n_ascending = int((diffs > 0).sum())
+    n_descending = int((diffs < 0).sum())
+    n_inversions = (n_descending if EXPECTED_DIRECTION == "ascending"
+                    else n_ascending)
 
-    for entry in centroid_entries:
-        label = int(entry["label"])
-        i = int(round(float(entry["X"])))
-        j = int(round(float(entry["Y"])))
-        k = int(round(float(entry["Z"])))
-
-        in_bounds = (0 <= i < shape[0] and 0 <= j < shape[1] and 0 <= k < shape[2])
-        if not in_bounds:
-            out_of_bounds.append({"label": label, "voxel": [i, j, k]})
-            continue
-
-        mask_at_voxel = int(msk_data[i, j, k])
-        if mask_at_voxel == label:
-            matched += 1
-        elif mask_at_voxel == 0:
-            label_mismatch.append({"label": label, "voxel": [i, j, k],
-                                   "got": "background"})
-        else:
-            label_mismatch.append({"label": label, "voxel": [i, j, k],
-                                   "got": mask_at_voxel})
-
-        if not np.any(msk_data == label):
-            label_missing_in_mask.append(label)
-
-    n = len(centroid_entries)
-    match_rate = matched / n if n else 0.0
     reasons = [
-        f"{matched}/{n} centroids land on the correct mask label "
-        f"(match rate {100*match_rate:.1f}%)",
+        f"{len(coms)} labels; checking continuity along axis {SPINE_AXIS} (I direction)",
+        f"label-ordered CoMs run {EXPECTED_DIRECTION}? "
+        f"{n_ascending} steps up, {n_descending} steps down ({n_inversions} inversions)",
     ]
-    extra: dict[str, Any] = {
-        "n_centroids": n,
-        "n_matched":   matched,
-        "match_rate":  round(match_rate, 4),
+    if dominant_axis != SPINE_AXIS:
+        reasons.append(f"WARN: dominant CoM spread is on axis {dominant_axis} "
+                       f"(spread={spreads[dominant_axis]:.1f}), not the expected "
+                       f"spine axis {SPINE_AXIS} (spread={spreads[SPINE_AXIS]:.1f}). "
+                       f"Possibly a single-vertebra scan or reorient anomaly.")
+
+    extra = {
+        "spine_axis":          SPINE_AXIS,
+        "dominant_axis":       dominant_axis,
+        "axis_spreads_voxels": [float(s) for s in spreads],
+        "n_inversions":        n_inversions,
+        "label_coms_voxel":    {str(l): list(c) for l, c in coms.items()},
     }
-    if direction is not None:
-        extra["direction"] = direction
-    if out_of_bounds:
-        reasons.append(f"{len(out_of_bounds)} centroids fall outside mask bounds: "
-                       f"{out_of_bounds[:5]}{'...' if len(out_of_bounds) > 5 else ''}")
-        extra["out_of_bounds"] = out_of_bounds
-    if label_mismatch:
-        reasons.append(f"{len(label_mismatch)} centroids land on wrong label "
-                       f"or background: {label_mismatch[:5]}"
-                       f"{'...' if len(label_mismatch) > 5 else ''}")
-        extra["label_mismatch"] = label_mismatch
-    if label_missing_in_mask:
-        reasons.append(f"WARN: {len(label_missing_in_mask)} centroid labels missing "
-                       f"from mask entirely: {label_missing_in_mask}")
-        extra["labels_missing_in_mask"] = label_missing_in_mask
 
-    if match_rate >= 0.95:
-        status = CheckStatus.PASS
-    elif match_rate >= 0.80:
-        status = CheckStatus.WARN
-    else:
-        status = CheckStatus.FAIL
-
-    return CheckResult(status=status, reasons=reasons, extra=extra)
+    if dominant_axis != SPINE_AXIS and spreads[SPINE_AXIS] < 5.0:
+        # The spine isn't oriented along axis 1; reorient may have failed
+        return CheckResult(status=CheckStatus.FAIL,
+                           reasons=reasons + ["FAIL: spine extent on expected axis < 5 voxels"],
+                           extra=extra)
+    if n_inversions <= MAX_LABEL_INVERSIONS:
+        return CheckResult(status=CheckStatus.PASS, reasons=reasons, extra=extra)
+    if n_inversions <= 3:
+        reasons.append(f"WARN: {n_inversions} > {MAX_LABEL_INVERSIONS} inversions")
+        return CheckResult(status=CheckStatus.WARN, reasons=reasons, extra=extra)
+    reasons.append(f"FAIL: {n_inversions} inversions suggest label assignment errors")
+    return CheckResult(status=CheckStatus.FAIL, reasons=reasons, extra=extra)
 
 
 # =============================================================================
@@ -441,11 +404,6 @@ def check_centroid_alignment(meta: dict[str, Any], info: dict) -> CheckResult:
 # =============================================================================
 
 def audit_scan(scan_dir_str: str) -> dict[str, Any]:
-    """Run all checks for one scan-dir; return the serialised ScanReport dict.
-
-    Top-level entry point for the multiprocessing worker pool — takes a path
-    as a string for picklability.
-    """
     scan_dir = Path(scan_dir_str)
     series_id = scan_dir.name.replace("scan-", "")
     meta_path = scan_dir / f"scan-{series_id}_meta.json"
@@ -472,11 +430,8 @@ def audit_scan(scan_dir_str: str) -> dict[str, Any]:
         return rep.to_dict()
 
     paths = meta["source_paths"]
-    ct_path  = Path(paths["ct"])  if "ct"  in paths else None
-    msk_path = Path(paths["msk"]) if "msk" in paths else None
-    if ct_path is None or msk_path is None:
-        rep.aggregate_overall()
-        return rep.to_dict()
+    ct_path  = Path(paths["ct"])
+    msk_path = Path(paths["msk"])
 
     result, info = check_headers_readable(ct_path, msk_path)
     rep.checks["headers_readable"] = result
@@ -484,10 +439,16 @@ def audit_scan(scan_dir_str: str) -> dict[str, Any]:
         rep.aggregate_overall()
         return rep.to_dict()
 
-    rep.checks["shape_match"]    = check_shape_match(info)
-    rep.checks["affine_match"]   = check_affine_match(info)
-    rep.checks["label_inventory"] = check_label_inventory(info)
-    rep.checks["centroid_alignment"] = check_centroid_alignment(meta, info)
+    rep.checks["shape_match"]     = check_shape_match(info)
+    rep.checks["affine_match"]    = check_affine_match(info)
+    rep.checks["orientation_pir"] = check_orientation_pir(info)
+
+    li = check_label_inventory(info)
+    rep.checks["label_inventory"] = li
+    if li.extra and "label_voxel_counts" in li.extra:
+        info["label_voxel_counts"] = li.extra["label_voxel_counts"]
+
+    rep.checks["label_continuity"] = check_label_continuity(info)
 
     info.pop("msk_data", None)
     info.pop("msk_img", None)
@@ -510,11 +471,10 @@ def _flush_logs() -> None:
             pass
 
 
-def run_qc(unified_dir: Path, workers: int = 8) -> dict[str, Any]:
-    """Run audit_scan over every scan-* subdir of unified_dir, parallelised."""
-    scan_dirs = sorted(d for d in unified_dir.iterdir()
+def run_qc(input_dir: Path, workers: int = 8) -> dict[str, Any]:
+    scan_dirs = sorted(d for d in input_dir.iterdir()
                        if d.is_dir() and d.name.startswith("scan-"))
-    log.info("Found %d scan directories to audit", len(scan_dirs))
+    log.info("Found %d scan directories to audit in %s", len(scan_dirs), input_dir)
 
     reports: list[dict[str, Any]] = []
     completed = 0
@@ -544,10 +504,9 @@ def run_qc(unified_dir: Path, workers: int = 8) -> dict[str, Any]:
 
     reports.sort(key=lambda r: r["series_id"])
 
-    # Summary
-    by_status:    dict[str, int]              = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
-    by_check:     dict[str, dict[str, int]]   = {}
-    flagged:      dict[str, list[dict]]       = {"WARN": [], "FAIL": []}
+    by_status: dict[str, int]            = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
+    by_check:  dict[str, dict[str, int]] = {}
+    flagged:   dict[str, list[dict]]     = {"WARN": [], "FAIL": []}
 
     for r in reports:
         by_status[r["overall"]] = by_status.get(r["overall"], 0) + 1
@@ -565,15 +524,19 @@ def run_qc(unified_dir: Path, workers: int = 8) -> dict[str, Any]:
             })
 
     return {
-        "version":         "0.2.0",
+        "version":         "0.4.0",
+        "input_dir":       str(input_dir),
         "n_scans_audited": len(reports),
         "by_status":       by_status,
         "by_check":        by_check,
         "flagged_scans":   flagged,
+        "spine_axis":          SPINE_AXIS,
+        "expected_direction":  EXPECTED_DIRECTION,
         "tolerances": {
-            "direction_dot_product": DIR_TOLERANCE,
-            "spacing_mm":            SPC_TOLERANCE,
-            "min_label_voxels":      MIN_LABEL_VOXELS,
+            "direction_dot_product":   DIR_TOLERANCE,
+            "spacing_mm":              SPC_TOLERANCE,
+            "min_label_voxels":        MIN_LABEL_VOXELS,
+            "max_label_inversions":    MAX_LABEL_INVERSIONS,
         },
         "scans":           reports,
     }
@@ -586,10 +549,10 @@ def run_qc(unified_dir: Path, workers: int = 8) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="verse-qc",
-        description="Per-scan alignment audit for VerSeFusion's unified corpus.",
+        description="Per-scan QC for canonical (PIR-reoriented) VerSe scans.",
     )
-    p.add_argument("--unified_dir", type=Path, required=True,
-                   help="Path to data/unified/ (contains scan-* subdirs).")
+    p.add_argument("--input_dir", type=Path, required=True,
+                   help="Directory of scan-* (typically data/canonical/).")
     p.add_argument("--out_dir", type=Path, required=True,
                    help="Where to write data/qc/qc_manifest.json.")
     p.add_argument("--workers", type=int, default=8,
@@ -606,12 +569,12 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    if not args.unified_dir.is_dir():
-        log.error("unified_dir not found: %s", args.unified_dir)
+    if not args.input_dir.is_dir():
+        log.error("input_dir not found: %s", args.input_dir)
         return 1
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest = run_qc(args.unified_dir, workers=args.workers)
+    manifest = run_qc(args.input_dir, workers=args.workers)
     out_path = args.out_dir / "qc_manifest.json"
     out_path.write_text(json.dumps(manifest, indent=2))
     log.info("Wrote QC manifest -> %s", out_path)

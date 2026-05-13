@@ -103,7 +103,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <h1>VerSeFusion QC renders</h1>
-<div class="subtitle">Per-scan visualization of CT + mask + centroid alignment. __N_RENDERS__ renders, sourced from __N_SCANS__ unified scans.</div>
+<div class="subtitle">Per-scan visualization of CT + mask + mask-derived centroid markers. __N_RENDERS__ renders, sourced from __N_SCANS__ unified scans.</div>
 
 <div class="summary">
   <span>Status:</span>
@@ -189,7 +189,7 @@ function render() {
       </a>
       <div class="card-meta">
         source: <code>${e.source_format || '–'}</code> ·
-        centroids: ${e.n_centroids ?? '?'}
+        labels: ${e.n_labels ?? '?'}
         ${e.failing_checks && e.failing_checks.length
           ? `<div class="failing-checks">flagged: ${e.failing_checks.join(", ")}</div>`
           : ''}
@@ -220,10 +220,10 @@ def build_gallery(renders_dir: Path, qc_manifest_path: Path | None,
         renders = json.loads(renders_idx.read_text()).get("renders", [])
     else:
         # Fall back to filesystem listing
-        renders = [{"series_id": p.stem,
-                    "out_path":  str(p),
+        renders = [{"series_id":     p.stem,
+                    "out_path":      str(p),
                     "source_format": None,
-                    "n_centroids": None}
+                    "n_labels":      None}
                    for p in sorted(renders_dir.glob("*.png"))]
     by_sid = {r["series_id"]: r for r in renders}
 
@@ -254,11 +254,11 @@ def build_gallery(renders_dir: Path, qc_manifest_path: Path | None,
         png_rel = Path(render["out_path"]).name   # gallery is in same dir as PNGs
 
         entries.append({
-            "series_id":     sid,
-            "png":           png_rel,
-            "source_format": render.get("source_format") or unify_entry.get("source_format"),
-            "n_centroids":   render.get("n_centroids"),
-            "overall":       qc_entry.get("overall"),
+            "series_id":      sid,
+            "png":            png_rel,
+            "source_format":  render.get("source_format") or unify_entry.get("source_format"),
+            "n_labels":       render.get("n_labels"),
+            "overall":        qc_entry.get("overall"),
             "failing_checks": failing,
         })
 
