@@ -10,6 +10,21 @@ For each scan in data/canonical/scan-*/, generates a 3-row × 2-col PNG:
 
 Stored volumes are PIR.  Sagittal slices are transposed so head appears at top.
 
+CHANGED (May 2026)
+------------------
+Every panel now renders at PHYSICAL mm coordinates with a fixed window size
+(default 600mm × 600mm centered on the mask centroid).  Earlier renders used
+matplotlib's `aspect="auto"`, which stretched each panel to fill the axes
+box — making a 200mm lumbar scan look the same height as a 700mm full-spine
+scan and producing visually inconsistent renders across the dataset.
+
+Now every panel of every scan covers exactly the same physical extent.
+Small partial-FOV scans appear as small images surrounded by black; large
+scans fill the window.  Vertebrae look the same size everywhere.
+
+Override the window size with --window_mm if your dataset includes full-body
+scans (consider 800-1000mm).
+
 Output: data/qc/renders/<series_id>.png
         data/qc/renders/renders_manifest.json
 """
@@ -33,6 +48,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import patheffects as mpe
 
+from verse_pipeline._render_helpers import (
+    DEFAULT_WINDOW_MM,
+    setup_mm_panel,
+    centroid_to_mm,
+    mask_centroid_vox,
+)
+
 log = logging.getLogger("verse.visualize")
 
 
@@ -40,7 +62,8 @@ log = logging.getLogger("verse.visualize")
 # constants
 # =============================================================================
 
-_HU_MIN, _HU_MAX = -200, 800
+# HU window — matches the CTSpinoPelvic1K make_qc_figure
+_HU_MIN, _HU_MAX = -150, 700
 DEFAULT_DPI = 100
 SLICE_TOLERANCE_VOX = 10
 
@@ -73,7 +96,7 @@ _PLANES: list[tuple[int, str]] = [(0, "Coronal"), (1, "Axial"), (2, "Sagittal")]
 
 
 # =============================================================================
-# helpers
+# helpers (image processing — unchanged from prior version)
 # =============================================================================
 
 def _window(ct: np.ndarray) -> np.ndarray:
@@ -97,6 +120,7 @@ def _overlay(base_2d: np.ndarray, lbl_2d: np.ndarray,
 
 
 def _display_slice(arr2d: np.ndarray, dim: int) -> np.ndarray:
+    """For sagittal (dim=2), transpose so head appears at top."""
     return arr2d.T if dim == 2 else arr2d
 
 
@@ -105,16 +129,6 @@ def _safe_slice(arr: np.ndarray, dim: int, idx: int) -> np.ndarray:
     s = [slice(None)] * arr.ndim
     s[dim] = clamped
     return arr[tuple(s)]
-
-
-def _choose_slices(ct: np.ndarray, msk: np.ndarray) -> tuple[int, int, int]:
-    nonzero = np.argwhere(msk > 0) if msk is not None else None
-    if nonzero is None or len(nonzero) == 0:
-        return tuple(s // 2 for s in ct.shape)
-    p = int(np.clip(int(nonzero[:, 0].mean()), 0, ct.shape[0] - 1))
-    i = int(np.clip(int(nonzero[:, 1].mean()), 0, ct.shape[1] - 1))
-    r = int(np.clip(int(nonzero[:, 2].mean()), 0, ct.shape[2] - 1))
-    return (p, i, r)
 
 
 def _label_coms(msk_data: np.ndarray, labels: list[int]) -> dict[int, tuple[float, float, float]]:
@@ -127,28 +141,23 @@ def _label_coms(msk_data: np.ndarray, labels: list[int]) -> dict[int, tuple[floa
     return out
 
 
-def _centroid_screen_xy(com_pir, dim):
-    p, i, r = com_pir
-    if dim == 0:  return (r, i)
-    if dim == 1:  return (r, p)
-    return (p, i)
-
-
-def _draw_centroid_markers(ax, coms, dim, mid_idx) -> None:
+def _draw_centroid_markers_mm(ax, coms, dim, mid_idx, spacing) -> None:
+    """Plot per-vertebra centroid markers in mm coordinates."""
     for lbl, com in coms.items():
+        # In-slice check is in voxel coords (same as before)
         if dim == 0:    in_slice = abs(com[0] - mid_idx) < SLICE_TOLERANCE_VOX
         elif dim == 1:  in_slice = abs(com[1] - mid_idx) < SLICE_TOLERANCE_VOX
         else:           in_slice = abs(com[2] - mid_idx) < SLICE_TOLERANCE_VOX
         if not in_slice:
             continue
-        x, y = _centroid_screen_xy(com, dim)
-        ax.plot(x, y, marker="o", color="#FFE000",
+        x_mm, y_mm = centroid_to_mm(com, dim, spacing)
+        ax.plot(x_mm, y_mm, marker="o", color="#FFE000",
                 markersize=CENTROID_MARKER_SIZE,
                 markeredgecolor="#222",
                 markeredgewidth=CENTROID_MARKER_EDGEWIDTH,
                 linestyle="")
         ax.annotate(
-            str(lbl), xy=(x, y), color="#FFE000",
+            str(lbl), xy=(x_mm, y_mm), color="#FFE000",
             fontsize=CENTROID_LABEL_FONTSIZE, weight="bold",
             xytext=CENTROID_LABEL_OFFSET, textcoords="offset points",
             path_effects=[mpe.withStroke(linewidth=2.5, foreground="#111")],
@@ -160,7 +169,8 @@ def _draw_centroid_markers(ax, coms, dim, mid_idx) -> None:
 # =============================================================================
 
 def render_scan(scan_dir: Path, out_path: Path,
-                dpi: int = DEFAULT_DPI) -> dict[str, Any]:
+                dpi: int = DEFAULT_DPI,
+                window_mm: float = DEFAULT_WINDOW_MM) -> dict[str, Any]:
     series_id = scan_dir.name.replace("scan-", "")
     meta_path = scan_dir / f"scan-{series_id}_meta.json"
     if not meta_path.exists():
@@ -176,78 +186,97 @@ def render_scan(scan_dir: Path, out_path: Path,
     ct_data  = ct_data [:mn[0], :mn[1], :mn[2]]
     msk_data = msk_data[:mn[0], :mn[1], :mn[2]]
 
+    # Voxel spacing in mm from the affine column norms.  Assumes CT and mask
+    # affines agree (verified end-to-end by orientation_audit.py).
     spacing = tuple(float(np.linalg.norm(ct_img.affine[:3, k])) for k in range(3))
     labels_present = sorted(int(l) for l in np.unique(msk_data) if l != 0)
     coms = _label_coms(msk_data, labels_present)
 
-    p_idx, i_idx, r_idx = _choose_slices(ct_data, msk_data)
+    # Window center: mask centroid (falls back to volume center if mask empty)
+    center_vox = mask_centroid_vox(msk_data)
+
+    # Slice indices: use the same centroid for slice picking, so each panel
+    # naturally shows the most informative cross-section.
+    p_idx = int(np.clip(round(center_vox[0]), 0, ct_data.shape[0] - 1))
+    i_idx = int(np.clip(round(center_vox[1]), 0, ct_data.shape[1] - 1))
+    r_idx = int(np.clip(round(center_vox[2]), 0, ct_data.shape[2] - 1))
     slice_by_dim = {0: p_idx, 1: i_idx, 2: r_idx}
 
     fig, axes = plt.subplots(3, 2, figsize=(9, 13),
                               gridspec_kw={"hspace": 0.04, "wspace": 0.04})
-    fig.patch.set_facecolor("#111111")
-    for ax in axes.flat:
-        ax.set_facecolor("#111111")
-        ax.axis("off")
+    try:
+        fig.patch.set_facecolor("#111111")
+        for ax in axes.flat:
+            ax.set_facecolor("#111111"); ax.axis("off")
 
-    axes[0, 0].set_title("Raw CT",          fontsize=10, color="#cccccc", pad=2)
-    axes[0, 1].set_title("CT + mask + CoM", fontsize=10, color="#cccccc", pad=2)
+        axes[0, 0].set_title("Raw CT",          fontsize=10, color="#cccccc", pad=2)
+        axes[0, 1].set_title("CT + mask + CoM", fontsize=10, color="#cccccc", pad=2)
 
-    ct_win = _window(ct_data)
+        ct_win = _window(ct_data)
 
-    for row, (dim, plane_name) in enumerate(_PLANES):
-        idx = slice_by_dim[dim]
-        ct_slice  = _display_slice(_safe_slice(ct_win,   dim, idx), dim)
-        msk_slice = _display_slice(_safe_slice(msk_data, dim, idx), dim)
+        for row, (dim, plane_name) in enumerate(_PLANES):
+            idx = slice_by_dim[dim]
+            ct_slice  = _display_slice(_safe_slice(ct_win,   dim, idx), dim)
+            msk_slice = _display_slice(_safe_slice(msk_data, dim, idx), dim)
 
-        rgb_raw = np.stack([ct_slice, ct_slice, ct_slice], axis=-1)
-        rgb_ov  = _overlay(ct_slice, msk_slice, _VERSE_COLORS)
+            rgb_raw = np.stack([ct_slice, ct_slice, ct_slice], axis=-1)
+            rgb_ov  = _overlay(ct_slice, msk_slice, _VERSE_COLORS)
 
-        axes[row, 0].imshow(rgb_raw, aspect="auto", interpolation="nearest")
-        axes[row, 1].imshow(rgb_ov,  aspect="auto", interpolation="nearest")
-        _draw_centroid_markers(axes[row, 1], coms, dim, idx)
+            setup_mm_panel(axes[row, 0], rgb_raw, dim, spacing, center_vox, window_mm)
+            # Axis off after extent is set
+            axes[row, 0].set_xticks([]); axes[row, 0].set_yticks([])
+            for s in axes[row, 0].spines.values(): s.set_visible(False)
 
-        axes[row, 0].text(
-            -0.04, 0.5,
-            f"{plane_name}  {_PLANE_AXIS_NAMES[dim]}={idx}",
-            transform=axes[row, 0].transAxes,
-            fontsize=8, color="#aaaaaa",
-            rotation=90, va="center", ha="right",
+            setup_mm_panel(axes[row, 1], rgb_ov,  dim, spacing, center_vox, window_mm)
+            axes[row, 1].set_xticks([]); axes[row, 1].set_yticks([])
+            for s in axes[row, 1].spines.values(): s.set_visible(False)
+
+            _draw_centroid_markers_mm(axes[row, 1], coms, dim, idx, spacing)
+
+            axes[row, 0].text(
+                -0.04, 0.5,
+                f"{plane_name}  {_PLANE_AXIS_NAMES[dim]}={idx}",
+                transform=axes[row, 0].transAxes,
+                fontsize=8, color="#aaaaaa",
+                rotation=90, va="center", ha="right",
+            )
+
+        source_format = meta.get("source_format", "?")
+        fig.suptitle(
+            f"{series_id}   shape={tuple(msk_data.shape)}   "
+            f"spacing=({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f}) mm   "
+            f"labels={len(labels_present)}   window={window_mm:.0f}mm   src={source_format}",
+            fontsize=11, color="#dddddd", y=0.997,
         )
 
-    source_format = meta.get("source_format", "?")
-    fig.suptitle(
-        f"{series_id}   shape={tuple(msk_data.shape)}   "
-        f"spacing=({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f}) mm   "
-        f"labels={len(labels_present)}   src={source_format}",
-        fontsize=11, color="#dddddd", y=0.997,
-    )
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(out_path), dpi=dpi, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    plt.close(fig)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(out_path), dpi=dpi, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+    finally:
+        plt.close(fig)
 
     return {
         "series_id":     series_id,
         "source_format": source_format,
         "n_labels":      len(labels_present),
         "shape":         list(msk_data.shape),
+        "spacing_mm":    list(spacing),
+        "window_mm":     window_mm,
         "out_path":      str(out_path),
     }
 
 
 # =============================================================================
-# parallel orchestration  (unchanged from prior version)
+# parallel orchestration
 # =============================================================================
 
-def _render_one(args: tuple[str, str, int]) -> dict[str, Any]:
-    scan_dir_str, out_dir_str, dpi = args
+def _render_one(args: tuple[str, str, int, float]) -> dict[str, Any]:
+    scan_dir_str, out_dir_str, dpi, window_mm = args
     scan_dir = Path(scan_dir_str)
     series_id = scan_dir.name.replace("scan-", "")
     out_path = Path(out_dir_str) / f"{series_id}.png"
     try:
-        return render_scan(scan_dir, out_path, dpi=dpi)
+        return render_scan(scan_dir, out_path, dpi=dpi, window_mm=window_mm)
     except Exception as e:
         return {"series_id": series_id, "error": f"{type(e).__name__}: {e}"}
 
@@ -259,13 +288,14 @@ def _flush_logs() -> None:
 
 
 def render_many(scan_dirs: list[Path], out_dir: Path,
-                workers: int = 4, dpi: int = DEFAULT_DPI) -> list[dict[str, Any]]:
+                workers: int = 4, dpi: int = DEFAULT_DPI,
+                window_mm: float = DEFAULT_WINDOW_MM) -> list[dict[str, Any]]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    log.info("Rendering %d scans -> %s (workers=%d, dpi=%d)",
-             len(scan_dirs), out_dir, workers, dpi)
+    log.info("Rendering %d scans -> %s (workers=%d, dpi=%d, window=%.0fmm)",
+             len(scan_dirs), out_dir, workers, dpi, window_mm)
     _flush_logs()
 
-    work_items = [(str(d), str(out_dir), dpi) for d in scan_dirs]
+    work_items = [(str(d), str(out_dir), dpi, window_mm) for d in scan_dirs]
     results: list[dict[str, Any]] = []
     n_done = 0
     last_log_count = 0
@@ -333,6 +363,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit",      type=int)
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--dpi",        type=int, default=DEFAULT_DPI)
+    p.add_argument("--window_mm",  type=float, default=DEFAULT_WINDOW_MM,
+                   help="Physical extent of each panel in mm (default 600).  "
+                        "Increase for full-body scans.")
     p.add_argument("--log_level",  default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -351,11 +384,13 @@ def main(argv: list[str] | None = None) -> int:
     if not scans:
         log.error("No scans selected.")
         return 1
-    results = render_many(scans, args.out_dir, workers=args.workers, dpi=args.dpi)
+    results = render_many(scans, args.out_dir, workers=args.workers,
+                          dpi=args.dpi, window_mm=args.window_mm)
     index_path = args.out_dir / "renders_manifest.json"
     index_path.write_text(json.dumps({
         "n_rendered": sum(1 for r in results if "error" not in r),
         "n_failed":   sum(1 for r in results if "error" in r),
+        "window_mm":  args.window_mm,
         "renders":    results,
     }, indent=2))
     log.info("Wrote %s", index_path)

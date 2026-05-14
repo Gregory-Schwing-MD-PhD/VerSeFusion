@@ -1,33 +1,31 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=verse-hf-export
+#SBATCH --job-name=verse-hf-stage
 #SBATCH -q primary
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=256G
-#SBATCH --time=10:00:00
-#SBATCH --output=logs/verse-hf-export-%j.out
-#SBATCH --error=logs/verse-hf-export-%j.err
+#SBATCH --mem=16G
+#SBATCH --time=01:30:00
+#SBATCH --output=logs/verse-hf-stage-%j.out
+#SBATCH --error=logs/verse-hf-stage-%j.err
 #SBATCH --mail-type=END,FAIL
 
-# Stage and upload the VerSeFusion dataset to HuggingFace, plus a 10-case
-# sample by default.
+# Stage the VerSeFusion dataset (and 10-case sample) WITHOUT uploading.
 #
-# Hardcoded repos:
+# Same orientation gate, same staging logic as hf_export.sh, just stops
+# before the HuggingFace push so you can inspect data/hf_staging/ and
+# data/hf_staging_sample/ before deciding to upload.
+#
+# No HF_TOKEN required.  No network calls.
+#
+# Hardcoded repos (these still get baked into the staged README):
 #   Full:    gregoryschwingmdphd/VerseFusion
-#   Sample:  gregoryschwingmdphd/VerseFusion-Sample  (top 10 by label count)
-#
-# Required env:
-#   HF_TOKEN     HuggingFace access token with write scope.  Either set in
-#                shell, or use `huggingface-cli login` (token cached at
-#                ~/.cache/huggingface/token).
+#   Sample:  gregoryschwingmdphd/VerseFusion-Sample
 #
 # Optional env:
 #   HF_REPO_ID                 Override full-dataset repo
 #   HF_SAMPLE_REPO_ID          Override sample repo
 #   HF_SAMPLE_N                Sample size (default 10; set 0 to skip sample)
-#   HF_PUBLIC=1                Make both repos public (default: private)
-#   HF_NO_UPLOAD=1             Stage only; don't push
 #   HF_DATASET_PRETTY_NAME     Pretty name for README ("VerSeFusion" default)
 #   HF_SYMLINK=1               Symlink NIfTIs instead of copying
 #   HF_STAGING_DIR             Override staging dir (default: $DATA_DIR/hf_staging)
@@ -41,27 +39,17 @@ cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 
 HF_REPO_ID="${HF_REPO_ID:-gregoryschwingmdphd/VerseFusion}"
 HF_SAMPLE_REPO_ID="${HF_SAMPLE_REPO_ID:-gregoryschwingmdphd/VerseFusion-Sample}"
-HF_LSTV_REPO_ID="${HF_LSTV_REPO_ID:-gregoryschwingmdphd/VerseFusion-LSTV}"
 HF_SAMPLE_N="${HF_SAMPLE_N:-10}"
 HF_DATASET_PRETTY_NAME="${HF_DATASET_PRETTY_NAME:-VerSeFusion}"
 HF_STAGING_DIR="${HF_STAGING_DIR:-${DATA_DIR}/hf_staging}"
 HF_SAMPLE_STAGING_DIR="${HF_SAMPLE_STAGING_DIR:-${DATA_DIR}/hf_staging_sample}"
-HF_LSTV_STAGING_DIR="${HF_LSTV_STAGING_DIR:-${DATA_DIR}/hf_staging_lstv}"
 HF_MANIFEST_CSV="${HF_MANIFEST_CSV:-${DATA_DIR}/manifest/manifest.csv}"
 
-if [[ -z "${HF_TOKEN:-}" ]] && [[ ! -f "${HOME}/.cache/huggingface/token" ]]; then
-    echo "ERROR: no HF_TOKEN in env and no cached token at ~/.cache/huggingface/token"
-    echo "       Run with: HF_TOKEN=hf_xxx make hf-export-slurm"
-    echo "       Or run:   huggingface-cli login"
-    exit 1
-fi
-
 EXPORT_FLAGS=(
+    --no_upload
     --sample_n             "${HF_SAMPLE_N}"
     --sample_repo_id       "${HF_SAMPLE_REPO_ID}"
     --sample_staging_dir   "${HF_SAMPLE_STAGING_DIR}"
-    --lstv_repo_id         "${HF_LSTV_REPO_ID}"
-    --lstv_staging_dir     "${HF_LSTV_STAGING_DIR}"
 )
 # Manifest from stage 10 (gives us LSTV + cv_fold columns in the staged dataset)
 if [[ -f "${HF_MANIFEST_CSV}" ]]; then
@@ -70,33 +58,27 @@ else
     echo "WARNING: ${HF_MANIFEST_CSV} not found — staged dataset will lack manifest.csv."
     echo "         Run 'make manifest-slurm' first."
 fi
-# Stage mode: default 'hardlink' (instant on same-FS).
+# Stage mode: default 'hardlink' (instant on same-FS).  Override with
+# HF_STAGE_MODE=copy or HF_STAGE_MODE=symlink, or the legacy HF_SYMLINK=1.
 if [[ -n "${HF_STAGE_MODE:-}" ]]; then
     EXPORT_FLAGS+=( --stage_mode "${HF_STAGE_MODE}" )
 fi
-[[ "${HF_PUBLIC:-0}"    = "1" ]] && EXPORT_FLAGS+=( --public )
-[[ "${HF_NO_UPLOAD:-0}" = "1" ]] && EXPORT_FLAGS+=( --no_upload )
-[[ "${HF_SYMLINK:-0}"   = "1" ]] && EXPORT_FLAGS+=( --symlink )
-[[ -n "${HF_PREVIEW_DIR:-}" ]]  && EXPORT_FLAGS+=( --preview_dir "${HF_PREVIEW_DIR}" )
+[[ "${HF_SYMLINK:-0}" = "1" ]] && EXPORT_FLAGS+=( --symlink )
+[[ -n "${HF_PREVIEW_DIR:-}" ]] && EXPORT_FLAGS+=( --preview_dir "${HF_PREVIEW_DIR}" )
 
-mkdir -p "${HF_STAGING_DIR}" "${HF_SAMPLE_STAGING_DIR}" "${HF_LSTV_STAGING_DIR}"
+mkdir -p "${HF_STAGING_DIR}" "${HF_SAMPLE_STAGING_DIR}"
 
 echo "============================================================"
-echo "HF export job"
+echo "HF stage job (NO UPLOAD)"
 echo "  full repo:        ${HF_REPO_ID}"
 echo "  sample repo:      ${HF_SAMPLE_REPO_ID}"
-echo "  lstv repo:        ${HF_LSTV_REPO_ID}"
 echo "  sample_n:         ${HF_SAMPLE_N}"
 echo "  pretty_name:      ${HF_DATASET_PRETTY_NAME}"
 echo "  full staging:     ${HF_STAGING_DIR}"
 echo "  sample staging:   ${HF_SAMPLE_STAGING_DIR}"
-echo "  lstv staging:     ${HF_LSTV_STAGING_DIR}"
-echo "  public:           ${HF_PUBLIC:-0}"
-echo "  no_upload:        ${HF_NO_UPLOAD:-0}"
 echo "============================================================"
 
 singularity exec \
-    --env "HF_TOKEN=${HF_TOKEN:-}" \
     --bind "${REPO_ROOT}:${REPO_ROOT}" \
     --bind "${DATA_DIR}:${DATA_DIR}" \
     "${CONTAINER_SIF}" \
@@ -109,3 +91,14 @@ singularity exec \
         --dataset_pretty_name "${HF_DATASET_PRETTY_NAME}" \
         --workers         8 \
         "${EXPORT_FLAGS[@]}"
+
+echo ""
+echo "============================================================"
+echo "Staging complete.  Inspect:"
+echo "  du -sh ${HF_STAGING_DIR}"
+echo "  cat ${HF_STAGING_DIR}/README.md"
+echo "  cat ${HF_SAMPLE_STAGING_DIR}/sample_selection.json | jq .selected_ids"
+echo ""
+echo "When ready to upload, run:"
+echo "  HF_TOKEN=hf_xxx make hf-export-slurm"
+echo "============================================================"

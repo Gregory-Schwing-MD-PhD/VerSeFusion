@@ -1,22 +1,17 @@
 """
 visualize_corrections.py — VERIDAH-corrections review renders.
 
-Renders every subject in the veridah manifest:
+Same layout as before — 3 rows × 2-or-3 cols depending on subject kind —
+with the SAME mm-aware panel rendering as visualize.py (May 2026 change).
 
-  * Corrected subjects (label_override / t13_shift / t11_shift):
-      3 rows × 3 cols
-        Row 0: Coronal   Row 1: Axial   Row 2: Sagittal
-        Col 0: Raw CT    Col 1: BEFORE  Col 2: AFTER
+Every panel now covers a fixed mm window (default 600mm × 600mm) centered
+on the focus labels' centroid.  Aspect ratios are physically correct.  Every
+render across the dataset looks comparable in scale, regardless of voxel
+spacing or scan extent.
 
-  * Advisory-only subjects (TLTV / SR flags, no mask change):
-      3 rows × 2 cols
-        Col 0: Raw CT    Col 1: CANONICAL mask
-
-  * Rejected subjects (e.g. LabelOverrideMismatch):
-      3 rows × 2 cols  (same layout as advisory, header carries the reason)
-
-Stored volumes are PIR (axis 0 = P, axis 1 = I, axis 2 = R).  Sagittal
-panels are transposed so head appears at the top.
+The red ROI box still highlights remapped vertebrae on all three columns
+(Raw CT, BEFORE, AFTER) — but now in millimeter coordinates so it lands in
+exactly the right anatomical location.
 
 Output: data/corrected/renders/<series_id>_before_after.png
         data/corrected/renders/index.html
@@ -39,18 +34,39 @@ import nibabel as nib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from matplotlib import patheffects as mpe
+
+from verse_pipeline._render_helpers import (
+    DEFAULT_WINDOW_MM,
+    setup_mm_panel,
+    centroid_to_mm,
+    bbox_pir_to_mm,
+    mask_centroid_vox,
+)
 
 log = logging.getLogger("verse.visualize_corrections")
 
 
 # =============================================================================
-# constants  (kept in sync with visualize.py)
+# constants
 # =============================================================================
 
-_HU_MIN, _HU_MAX = -200, 800
+_HU_MIN, _HU_MAX = -150, 700
 DEFAULT_DPI = 100
 SLICE_TOLERANCE_VOX = 10
+
+CENTROID_MARKER_SIZE      = 7
+CENTROID_LABEL_FONTSIZE   = 10
+CENTROID_LABEL_OFFSET     = (8, 6)
+CENTROID_MARKER_EDGEWIDTH = 1.0
+
+ROI_BOX_PAD_MM    = 10.0
+ROI_BOX_COLOR     = "#FF3344"
+ROI_BOX_LINEWIDTH = 2.0
+
+THORACIC_LABELS_MAX = 19
+T13_LABEL           = 28
 
 _VERSE_COLORS: dict[int, tuple[float, float, float, float]] = {
     1:  (0.30, 0.55, 0.95, 0.55),  2:  (0.25, 0.50, 0.90, 0.55),
@@ -107,7 +123,6 @@ def _overlay(base_2d: np.ndarray, lbl_2d: np.ndarray,
 
 
 def _display_slice(arr2d: np.ndarray, dim: int) -> np.ndarray:
-    """PIR-aware: sagittal (dim=2) transposed so head appears at top."""
     return arr2d.T if dim == 2 else arr2d
 
 
@@ -116,16 +131,6 @@ def _safe_slice(arr: np.ndarray, dim: int, idx: int) -> np.ndarray:
     s = [slice(None)] * arr.ndim
     s[dim] = clamped
     return arr[tuple(s)]
-
-
-def _choose_slices(ct: np.ndarray, msk: np.ndarray) -> tuple[int, int, int]:
-    nonzero = np.argwhere(msk > 0) if msk is not None else None
-    if nonzero is None or len(nonzero) == 0:
-        return tuple(s // 2 for s in ct.shape)
-    p = int(np.clip(int(nonzero[:, 0].mean()), 0, ct.shape[0] - 1))
-    i = int(np.clip(int(nonzero[:, 1].mean()), 0, ct.shape[1] - 1))
-    r = int(np.clip(int(nonzero[:, 2].mean()), 0, ct.shape[2] - 1))
-    return (p, i, r)
 
 
 def _label_coms(msk_data: np.ndarray, labels: list[int]) -> dict[int, tuple[float, float, float]]:
@@ -138,34 +143,84 @@ def _label_coms(msk_data: np.ndarray, labels: list[int]) -> dict[int, tuple[floa
     return out
 
 
-def _centroid_screen_xy(com_pir: tuple[float, float, float],
-                        dim: int) -> tuple[float, float]:
-    p, i, r = com_pir
-    if dim == 0:  return (r, i)
-    if dim == 1:  return (r, p)
-    return (p, i)  # dim == 2
-
-
-def _draw_centroid_markers(ax, coms, dim, mid_idx) -> None:
+def _draw_centroid_markers_mm(ax, coms, dim, mid_idx, spacing) -> None:
     for lbl, com in coms.items():
         if dim == 0:    in_slice = abs(com[0] - mid_idx) < SLICE_TOLERANCE_VOX
         elif dim == 1:  in_slice = abs(com[1] - mid_idx) < SLICE_TOLERANCE_VOX
         else:           in_slice = abs(com[2] - mid_idx) < SLICE_TOLERANCE_VOX
         if not in_slice:
             continue
-        x, y = _centroid_screen_xy(com, dim)
-        ax.plot(x, y, marker="o", color="#FFE000", markersize=4,
-                markeredgecolor="#222", markeredgewidth=0.7, linestyle="")
+        x_mm, y_mm = centroid_to_mm(com, dim, spacing)
+        ax.plot(x_mm, y_mm, marker="o", color="#FFE000",
+                markersize=CENTROID_MARKER_SIZE,
+                markeredgecolor="#222",
+                markeredgewidth=CENTROID_MARKER_EDGEWIDTH,
+                linestyle="")
         ax.annotate(
-            str(lbl), xy=(x, y), color="#FFE000",
-            fontsize=6, weight="bold",
-            xytext=(5, 4), textcoords="offset points",
-            path_effects=[mpe.withStroke(linewidth=2, foreground="#111")],
+            str(lbl), xy=(x_mm, y_mm), color="#FFE000",
+            fontsize=CENTROID_LABEL_FONTSIZE, weight="bold",
+            xytext=CENTROID_LABEL_OFFSET, textcoords="offset points",
+            path_effects=[mpe.withStroke(linewidth=2.5, foreground="#111")],
         )
 
 
+def _draw_roi_box(ax, mm_bbox: tuple[float, float, float, float] | None) -> None:
+    if mm_bbox is None:
+        return
+    x0, y0, x1, y1 = mm_bbox
+    rect = mpatches.Rectangle(
+        (x0, y0), x1 - x0, y1 - y0,
+        linewidth=ROI_BOX_LINEWIDTH, edgecolor=ROI_BOX_COLOR,
+        facecolor="none", zorder=10,
+    )
+    ax.add_patch(rect)
+
+
 # =============================================================================
-# classification + headers
+# ROI focus
+# =============================================================================
+
+def _affected_bbox_pir(msk_before: np.ndarray,
+                       focus_labels: set[int]) -> tuple[int, int, int, int, int, int] | None:
+    if not focus_labels:
+        return None
+    mask_focus = np.isin(msk_before, list(focus_labels))
+    if not mask_focus.any():
+        return None
+    coords = np.argwhere(mask_focus)
+    return (int(coords[:, 0].min()), int(coords[:, 1].min()), int(coords[:, 2].min()),
+            int(coords[:, 0].max()), int(coords[:, 1].max()), int(coords[:, 2].max()))
+
+
+def _compute_focus_labels(entry: dict[str, Any], kind: str,
+                          mask_labels: list[int]) -> set[int]:
+    if kind == "corrected":
+        remap = entry.get("remap", {})
+        return {int(k) for k in remap.keys()}
+    if kind == "advisory":
+        if T13_LABEL in mask_labels:
+            return {T13_LABEL}
+        thoracic_in_mask = [l for l in mask_labels if 8 <= l <= THORACIC_LABELS_MAX]
+        if thoracic_in_mask:
+            return {max(thoracic_in_mask)}
+        return set()
+    return set()
+
+
+def _focus_center_vox(msk_before: np.ndarray,
+                      focus_labels: set[int]) -> tuple[float, float, float]:
+    """Window center: centroid of focus labels if any, else whole-mask centroid."""
+    if focus_labels:
+        mask_focus = np.isin(msk_before, list(focus_labels))
+        coords = np.argwhere(mask_focus)
+        if len(coords) > 0:
+            com = coords.mean(axis=0)
+            return (float(com[0]), float(com[1]), float(com[2]))
+    return mask_centroid_vox(msk_before)
+
+
+# =============================================================================
+# classification + headers + caption
 # =============================================================================
 
 def _classify_subject(entry: dict[str, Any]) -> str:
@@ -211,16 +266,49 @@ def _header_for(entry: dict[str, Any], kind: str,
     return f"{sid}   fid={fid}   type={ctype}\n{line2}"
 
 
+def _reviewer_caption(kind: str, entry: dict[str, Any]) -> str:
+    if kind == "corrected":
+        ctype = entry.get("correction_type", "")
+        if ctype == "t13_shift":
+            return (
+                "REVIEW: Within the red box, verify the PURPLE vertebra (label 28 = T13) "
+                "articulates with RIBS, and the YELLOW vertebrae below (labels 20-24 = L1-L5) "
+                "have NO RIBS.  Coronal panel is best for rib counting."
+            )
+        return (
+            "REVIEW: Verify that each THORACIC label (green 8-19, purple 28) articulates "
+            "with RIBS, and each LUMBAR label (yellow/orange 20-25) has NO RIBS.  "
+            "Coronal panel is best for rib counting."
+        )
+    if kind == "advisory":
+        return (
+            "REVIEW: The red box marks the last thoracic vertebra (Möller flagged "
+            "TLTV / stump-rib).  Inspect its rib morphology — small / asymmetric / "
+            "absent ribs are the diagnostic features."
+        )
+    if kind == "rejected":
+        return (
+            "Correction was NOT applied — see header for reason.  "
+            "Inspect canonical mask vs. raw CT to decide next steps."
+        )
+    return "Canonical mask shown."
+
+
 # =============================================================================
-# core renderers
+# core renderers (mm-aware)
 # =============================================================================
 
-def _render_three_panels(axes_col, ct_data: np.ndarray,
+def _render_three_panels(axes_col,
+                          ct_data:  np.ndarray,
                           msk_data: np.ndarray | None,
                           slice_by_dim: dict[int, int],
-                          coms: dict[int, tuple[float, float, float]] | None,
+                          coms:     dict[int, tuple[float, float, float]] | None,
+                          roi_pir_bbox: tuple[int, int, int, int, int, int] | None,
+                          spacing:  tuple[float, float, float],
+                          center_vox: tuple[float, float, float],
+                          window_mm: float,
                           show_plane_labels: bool) -> None:
-    """Draw the three rows (coronal/axial/sagittal) into one column of axes."""
+    """Draw the three rows (coronal/axial/sagittal) into one column."""
     ct_win = _window(ct_data)
 
     for row, (dim, plane_name) in enumerate(_PLANES):
@@ -233,18 +321,22 @@ def _render_three_panels(axes_col, ct_data: np.ndarray,
         else:
             rgb = np.stack([ct_slice, ct_slice, ct_slice], axis=-1)
 
-        axes_col[row].imshow(rgb, aspect="auto", interpolation="nearest")
-        axes_col[row].axis("off")
+        setup_mm_panel(axes_col[row], rgb, dim, spacing, center_vox, window_mm)
+        axes_col[row].set_xticks([]); axes_col[row].set_yticks([])
+        for s in axes_col[row].spines.values(): s.set_visible(False)
 
         if coms is not None and msk_data is not None:
-            _draw_centroid_markers(axes_col[row], coms, dim, idx)
+            _draw_centroid_markers_mm(axes_col[row], coms, dim, idx, spacing)
+
+        roi_mm = bbox_pir_to_mm(roi_pir_bbox, dim, spacing, pad_mm=ROI_BOX_PAD_MM)
+        _draw_roi_box(axes_col[row], roi_mm)
 
         if show_plane_labels:
             axes_col[row].text(
                 -0.06, 0.5,
                 f"{plane_name}  {_PLANE_AXIS_NAMES[dim]}={idx}",
                 transform=axes_col[row].transAxes,
-                fontsize=7, color="#aaaaaa",
+                fontsize=8, color="#aaaaaa",
                 rotation=90, va="center", ha="right",
             )
 
@@ -256,6 +348,7 @@ def render_subject(
     out_path: Path,
     entry: dict[str, Any],
     dpi: int = DEFAULT_DPI,
+    window_mm: float = DEFAULT_WINDOW_MM,
 ) -> dict[str, Any]:
     kind = _classify_subject(entry)
 
@@ -266,16 +359,29 @@ def render_subject(
     ct_data    = np.asarray(ct_img.dataobj).astype(np.float32)
     canon_data = np.asarray(canon_msk.dataobj).astype(np.int32)
 
-    # shape harmonization
     mn = tuple(min(a, b) for a, b in zip(ct_data.shape, canon_data.shape))
     ct_data    = ct_data   [:mn[0], :mn[1], :mn[2]]
     canon_data = canon_data[:mn[0], :mn[1], :mn[2]]
 
+    spacing = tuple(float(np.linalg.norm(ct_img.affine[:3, k])) for k in range(3))
     labels_before = sorted(int(l) for l in np.unique(canon_data) if l != 0)
     coms_before = _label_coms(canon_data, labels_before)
-    p_idx, i_idx, r_idx = _choose_slices(ct_data, canon_data)
+
+    # ROI focus labels and bbox
+    focus_labels = _compute_focus_labels(entry, kind, labels_before)
+    roi_bbox     = _affected_bbox_pir(canon_data, focus_labels)
+
+    # Window center: focus labels if any (so corrections zoom in on the ROI),
+    # otherwise whole-mask centroid.
+    center_vox = _focus_center_vox(canon_data, focus_labels)
+
+    # Slice indices at the window center
+    p_idx = int(np.clip(round(center_vox[0]), 0, ct_data.shape[0] - 1))
+    i_idx = int(np.clip(round(center_vox[1]), 0, ct_data.shape[1] - 1))
+    r_idx = int(np.clip(round(center_vox[2]), 0, ct_data.shape[2] - 1))
     slice_by_dim = {0: p_idx, 1: i_idx, 2: r_idx}
 
+    # Load AFTER mask for corrected subjects
     corr_data: np.ndarray | None = None
     labels_after = labels_before
     coms_after = coms_before
@@ -289,81 +395,88 @@ def render_subject(
         labels_after = sorted(int(l) for l in np.unique(corr_data) if l != 0)
         coms_after   = _label_coms(corr_data, labels_after)
 
-    # ---- figure layout depends on kind ----
+    # Figure layout
     if kind == "corrected":
-        fig, axes = plt.subplots(3, 3, figsize=(13, 12),
+        fig, axes = plt.subplots(3, 3, figsize=(14, 13),
                                   gridspec_kw={"hspace": 0.04, "wspace": 0.04})
         col_titles = ["Raw CT", "BEFORE (canonical)", "AFTER (corrected)"]
     else:
-        fig, axes = plt.subplots(3, 2, figsize=(9, 12),
+        fig, axes = plt.subplots(3, 2, figsize=(10, 13),
                                   gridspec_kw={"hspace": 0.04, "wspace": 0.04})
         col_titles = ["Raw CT", "CANONICAL mask"]
 
     fig.patch.set_facecolor("#111111")
-    for ax in axes.flat:
-        ax.set_facecolor("#111111")
-        ax.axis("off")
+    try:
+        for ax in axes.flat:
+            ax.set_facecolor("#111111")
+            ax.axis("off")
 
-    for ci, t in enumerate(col_titles):
-        axes[0, ci].set_title(t, fontsize=9, color="#cccccc", pad=2)
+        for ci, t in enumerate(col_titles):
+            axes[0, ci].set_title(t, fontsize=10, color="#cccccc", pad=2)
 
-    # column 0: raw CT (no mask)
-    _render_three_panels([axes[r, 0] for r in range(3)],
-                          ct_data, None, slice_by_dim, None,
-                          show_plane_labels=True)
+        # column 0: raw CT (no mask) — best for counting ribs
+        _render_three_panels([axes[r, 0] for r in range(3)],
+                              ct_data, None, slice_by_dim, None,
+                              roi_bbox, spacing, center_vox, window_mm,
+                              show_plane_labels=True)
 
-    # column 1: canonical mask (BEFORE for corrected; CANONICAL for others)
-    _render_three_panels([axes[r, 1] for r in range(3)],
-                          ct_data, canon_data, slice_by_dim, coms_before,
-                          show_plane_labels=False)
-
-    # column 2: corrected mask (only for corrected subjects)
-    if kind == "corrected" and corr_data is not None:
-        _render_three_panels([axes[r, 2] for r in range(3)],
-                              ct_data, corr_data, slice_by_dim, coms_after,
+        # column 1: canonical mask (BEFORE for corrected, CANONICAL otherwise)
+        _render_three_panels([axes[r, 1] for r in range(3)],
+                              ct_data, canon_data, slice_by_dim, coms_before,
+                              roi_bbox, spacing, center_vox, window_mm,
                               show_plane_labels=False)
 
-    # ---- suptitle, border, footer ----
-    title_color = "#dddddd"
-    if kind == "rejected":
-        title_color = "#ff6666"
-    elif kind == "corrected":
-        title_color = "#a3e565"
-    elif kind == "advisory":
+        # column 2: corrected mask (only for corrected)
+        if kind == "corrected" and corr_data is not None:
+            _render_three_panels([axes[r, 2] for r in range(3)],
+                                  ct_data, corr_data, slice_by_dim, coms_after,
+                                  roi_bbox, spacing, center_vox, window_mm,
+                                  show_plane_labels=False)
+
+        # suptitle / borders / caption
         title_color = "#dddddd"
+        if kind == "rejected":   title_color = "#ff6666"
+        elif kind == "corrected": title_color = "#a3e565"
 
-    fig.suptitle(
-        _header_for(entry, kind, labels_before, labels_after),
-        fontsize=10, color=title_color, y=0.997,
-    )
+        fig.suptitle(
+            _header_for(entry, kind, labels_before, labels_after),
+            fontsize=11, color=title_color, y=0.997,
+        )
 
-    # colored border around all axes for kind cue
-    border = _KIND_BORDER.get(kind, "#888888")
-    for ax in axes.flat:
-        for s in ax.spines.values():
-            s.set_edgecolor(border)
-            s.set_linewidth(0.8)
-            s.set_visible(True)
+        border = _KIND_BORDER.get(kind, "#888888")
+        for ax in axes.flat:
+            for s in ax.spines.values():
+                s.set_edgecolor(border)
+                s.set_linewidth(0.8)
+                s.set_visible(True)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(out_path), dpi=dpi, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    plt.close(fig)
+        caption = _reviewer_caption(kind, entry)
+        fig.text(0.5, 0.012, caption, ha="center", va="bottom", fontsize=9,
+                 color="#dddddd", style="italic", wrap=True)
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(out_path), dpi=dpi, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+    finally:
+        plt.close(fig)
 
     return {
-        "series_id":      series_id,
-        "fid":            entry.get("fid"),
-        "kind":           kind,
+        "series_id":       series_id,
+        "fid":             entry.get("fid"),
+        "kind":            kind,
         "correction_type": entry.get("correction_type"),
-        "strategy":       entry.get("strategy"),
-        "remap":          entry.get("remap", {}),
-        "tltv":           entry.get("tltv", False),
-        "sr_left":        entry.get("sr_left", False),
-        "sr_right":       entry.get("sr_right", False),
-        "error":          entry.get("error"),
-        "labels_before":  labels_before,
-        "labels_after":   labels_after,
-        "out_path":       str(out_path),
+        "strategy":        entry.get("strategy"),
+        "remap":           entry.get("remap", {}),
+        "tltv":            entry.get("tltv", False),
+        "sr_left":         entry.get("sr_left", False),
+        "sr_right":        entry.get("sr_right", False),
+        "error":           entry.get("error"),
+        "labels_before":   labels_before,
+        "labels_after":    labels_after,
+        "roi_focus_labels": sorted(focus_labels),
+        "spacing_mm":      list(spacing),
+        "window_mm":       window_mm,
+        "out_path":        str(out_path),
     }
 
 
@@ -371,12 +484,12 @@ def render_subject(
 # parallel orchestration
 # =============================================================================
 
-def _render_one(args: tuple[str, str, str, str, dict, int]) -> dict[str, Any]:
-    series_id, canon_dir_str, corr_dir_str, out_dir_str, entry, dpi = args
+def _render_one(args: tuple[str, str, str, str, dict, int, float]) -> dict[str, Any]:
+    series_id, canon_dir_str, corr_dir_str, out_dir_str, entry, dpi, window_mm = args
     out_path = Path(out_dir_str) / f"{series_id}_before_after.png"
     try:
         return render_subject(series_id, Path(canon_dir_str), Path(corr_dir_str),
-                              out_path, entry, dpi=dpi)
+                              out_path, entry, dpi=dpi, window_mm=window_mm)
     except Exception as e:
         return {"series_id": series_id, "error": f"{type(e).__name__}: {e}"}
 
@@ -394,6 +507,7 @@ def render_all_csv_subjects(
     veridah_manifest_path: Path,
     workers: int = 4,
     dpi: int = DEFAULT_DPI,
+    window_mm: float = DEFAULT_WINDOW_MM,
     only_kinds: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     if not veridah_manifest_path.exists():
@@ -404,7 +518,8 @@ def render_all_csv_subjects(
     if only_kinds is not None:
         entries = [e for e in entries if _classify_subject(e) in only_kinds]
 
-    log.info("Rendering %d subjects (from %s)", len(entries), veridah_manifest_path)
+    log.info("Rendering %d subjects (from %s, window=%.0fmm)",
+             len(entries), veridah_manifest_path, window_mm)
     if not entries:
         log.warning("No subjects to render.")
         return []
@@ -412,7 +527,7 @@ def render_all_csv_subjects(
     out_dir.mkdir(parents=True, exist_ok=True)
     work_items = [
         (entry["series_id"], str(canonical_dir), str(corrected_dir),
-         str(out_dir), entry, dpi)
+         str(out_dir), entry, dpi, window_mm)
         for entry in entries
     ]
 
@@ -464,7 +579,13 @@ GALLERY_HTML = """<!DOCTYPE html>
   body { margin:0; padding:24px; background:#111111; color:#dddddd;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
   h1 { margin:0 0 4px; font-size:22px; font-weight:500; }
-  .subtitle { color:#888; font-size:14px; margin-bottom:20px; }
+  .subtitle { color:#888; font-size:14px; margin-bottom:8px; }
+  .reviewer-note {
+    background:#1a1a1a; border:1px solid #FF3344; border-radius:8px;
+    padding:12px 16px; margin-bottom:20px; font-size:13px;
+    color:#ddd; line-height:1.5;
+  }
+  .reviewer-note strong { color:#FF6677; }
   .controls {
     position: sticky; top: 0; background: #111111; padding: 10px 0; z-index: 10;
     border-bottom: 1px solid #333; margin-bottom: 20px;
@@ -500,6 +621,16 @@ GALLERY_HTML = """<!DOCTYPE html>
 <body>
 <h1>VerSeFusion — VERIDAH corrections</h1>
 <div class="subtitle">All __N_TOTAL__ subjects from Möller's corrections CSV.</div>
+
+<div class="reviewer-note">
+  <strong>Reviewer workflow:</strong>
+  For each <em>corrected</em> subject, verify within the RED ROI BOX that
+  <strong>thoracic</strong> labels (green 8-19, purple 28 = T13) articulate with <strong>RIBS</strong>,
+  and <strong>lumbar</strong> labels (yellow/orange 20-25) have <strong>NO RIBS</strong>.
+  The Raw CT column (leftmost) is best for counting ribs without color overlay.
+  For <em>advisory</em> subjects, the ROI box marks the last thoracic vertebra —
+  inspect its rib morphology to confirm Möller's TLTV / stump-rib flag.
+</div>
 
 <div class="summary">
   <span>Outcomes:</span>
@@ -639,6 +770,8 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["corrected", "advisory", "rejected", "passthrough_other"])
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--dpi",     type=int, default=DEFAULT_DPI)
+    p.add_argument("--window_mm", type=float, default=DEFAULT_WINDOW_MM,
+                   help="Physical extent of each panel in mm (default 600).")
     p.add_argument("--log_level", default="INFO")
     return p
 
@@ -659,13 +792,14 @@ def main(argv: list[str] | None = None) -> int:
     results = render_all_csv_subjects(
         args.canonical_dir, args.corrected_dir, args.out_dir,
         veridah_manifest, workers=args.workers, dpi=args.dpi,
-        only_kinds=only_kinds,
+        window_mm=args.window_mm, only_kinds=only_kinds,
     )
 
     index_path = args.out_dir / "renders_manifest.json"
     index_path.write_text(json.dumps({
         "n_rendered": sum(1 for r in results if "out_path" in r),
         "n_failed":   sum(1 for r in results if "out_path" not in r),
+        "window_mm":  args.window_mm,
         "renders":    results,
     }, indent=2))
     log.info("Wrote %s", index_path)
