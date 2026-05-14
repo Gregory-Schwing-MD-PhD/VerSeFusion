@@ -149,7 +149,7 @@ help:
 	@echo "    hf-stage-local     Stage both repos interactively, NO upload (quick smoke test)"
 	@echo "    hf-export-slurm    Stage + upload BOTH via SLURM. Usage:"
 	@echo "                         HF_TOKEN=hf_xxx make hf-export-slurm"
-	@echo "    hf-clean           Wipe data/hf_staging/ and data/hf_staging_sample/"
+	@echo "    hf-clean           Wipe data/hf_staging/, data/hf_staging_sample/, and data/hf_staging_lstv/"
 	@echo "    Override: HF_REPO_ID, HF_SAMPLE_REPO_ID, HF_SAMPLE_N (0=skip sample),"
 	@echo "              HF_PUBLIC=1, HF_DATASET_PRETTY_NAME"
 	@echo ""
@@ -535,9 +535,9 @@ hf-export-slurm: setup
 	    $(REPO_ROOT)/slurm/hf_export.sh
 
 hf-clean:
-	@echo "Removing $(HF_STAGING) and $(HF_STAGING)_sample ..."
-	rm -rf $(HF_STAGING) $(HF_STAGING)_sample
-	@mkdir -p $(HF_STAGING) $(HF_STAGING)_sample
+	@echo "Removing $(HF_STAGING), $(HF_STAGING)_sample, and $(HF_STAGING)_lstv ..."
+	rm -rf $(HF_STAGING) $(HF_STAGING)_sample $(HF_STAGING)_lstv
+	@mkdir -p $(HF_STAGING) $(HF_STAGING)_sample $(HF_STAGING)_lstv
 
 # -----------------------------------------------------------------------------
 # Convenience: chain everything via SLURM dependencies

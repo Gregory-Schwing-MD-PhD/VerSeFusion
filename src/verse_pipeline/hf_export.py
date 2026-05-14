@@ -800,6 +800,182 @@ def copy_manifest(manifest_csv: Path | None,
     return dst_csv
 
 
+def write_radiologist_review_csv(
+    staging_dir:       Path,
+    manifest_csv_path: Path | None,
+    lstv_audit_path:   Path | None = None,
+    subset_ids:        set[str] | None = None,
+) -> Path | None:
+    """Write a radiologist-friendly CSV summarizing each scan's anomaly status.
+
+    Columns are projected from manifest.csv and (when available) joined with
+    the LSTV audit's per-scan evidence strings — the auditor's plain-English
+    reasoning for why a scan was classified as e.g. "lumbarization" vs
+    "lsj_fov_truncated".  These evidence strings are typically what a
+    radiologist wants when deciding which cases to spot-check.
+
+    Sorted with anomalies on top (t13 > lumb > trunc > normal), then by
+    series_id.
+    """
+    if manifest_csv_path is None or not manifest_csv_path.exists():
+        log.warning("Skipping radiologist_review.csv — no manifest.csv at %s",
+                    manifest_csv_path)
+        return None
+
+    import pandas as pd
+    df = pd.read_csv(manifest_csv_path)
+    if subset_ids is not None:
+        df = df[df["series_id"].astype(str).isin(subset_ids)].copy()
+
+    # Join in evidence strings from the LSTV audit if we can find it
+    evidence: dict[str, dict[str, str]] = {}
+    if lstv_audit_path and lstv_audit_path.exists():
+        try:
+            audit = json.loads(lstv_audit_path.read_text())
+            for sub in audit.get("subjects", []) or []:
+                sid = sub.get("series_id")
+                if sid:
+                    evidence[str(sid)] = {
+                        "lstv_evidence": sub.get("lstv_evidence", "") or "",
+                        "tltv_evidence": sub.get("tltv_evidence", "") or "",
+                    }
+        except (OSError, ValueError) as e:
+            log.warning("Could not read LSTV audit at %s for evidence join: %s",
+                        lstv_audit_path, e)
+
+    df["lstv_evidence"] = df["series_id"].astype(str).map(
+        lambda s: evidence.get(s, {}).get("lstv_evidence", ""))
+    df["tltv_evidence"] = df["series_id"].astype(str).map(
+        lambda s: evidence.get(s, {}).get("tltv_evidence", ""))
+
+    # Project radiologist-facing columns (in this order); skip any that don't exist
+    radiologist_cols = [
+        "series_id",
+        "lstv_class",            # 4-way summary cohort
+        "lstv_class_audit",      # raw LSJ verdict from auditor
+        "tltv_class_audit",      # raw TLJ verdict from auditor
+        "lstv_evidence",         # plain-English reasoning
+        "tltv_evidence",
+        "n_labels",
+        "labels_present",
+        "has_T13",
+        "has_L6",
+        "lacks_T12_TLJ_in_FOV",
+        "veridah_applied",
+        "veridah_kind",
+        "veridah_action",
+        "source_dataset",
+        "source_format",
+        "sex",
+        "age",
+        "patient_id",
+        "split",                 # VerSe's original (not ML splits)
+        "ct_relative_path",
+        "mask_relative_path",
+    ]
+    cols = [c for c in radiologist_cols if c in df.columns]
+    out_df = df[cols].copy()
+
+    # Sort: anomalies first by clinical priority, then by series_id
+    class_order = {
+        "t13_supernumerary": 0,
+        "lumbarization":     1,
+        "truncated":         2,
+        "normal":            3,
+    }
+    out_df["_sort_key"] = out_df["lstv_class"].map(class_order).fillna(99)
+    out_df = (out_df.sort_values(["_sort_key", "series_id"])
+                    .drop(columns=["_sort_key"])
+                    .reset_index(drop=True))
+
+    out_path = staging_dir / "radiologist_review.csv"
+    out_df.to_csv(out_path, index=False)
+    log.info("Wrote radiologist_review.csv (%d rows, %d columns) — %s",
+             len(out_df), len(cols), out_path)
+    return out_path
+
+
+def write_browse_by_class_md(
+    staging_dir:       Path,
+    manifest_csv_path: Path | None,
+    subset_ids:        set[str] | None = None,
+) -> Path | None:
+    """Write a 'browse by anomaly class' markdown index for the dataset.
+
+    Groups every scan under its `lstv_class`, with internal links to its
+    scans/<series_id>/ directory.  Renders nicely on HuggingFace's dataset
+    file viewer.  Drops the 'normal' section if there are more than 50
+    normals (too long to be useful as a browse-by-class index).
+    """
+    if manifest_csv_path is None or not manifest_csv_path.exists():
+        return None
+
+    import pandas as pd
+    df = pd.read_csv(manifest_csv_path)
+    if subset_ids is not None:
+        df = df[df["series_id"].astype(str).isin(subset_ids)].copy()
+    if len(df) == 0:
+        return None
+
+    class_titles = {
+        "t13_supernumerary": "T13 supernumerary  (extra thoracic vertebra)",
+        "lumbarization":     "Lumbarization  (L6 present — sixth lumbar / S1 lumbarized)",
+        "truncated":         "T12 absent  (genuine absence, not FOV truncation)",
+        "normal":            "Normal lumbosacral / thoracolumbar anatomy",
+    }
+    class_order = ["t13_supernumerary", "lumbarization", "truncated", "normal"]
+
+    total = len(df)
+    n_anom = int((df["lstv_class"] != "normal").sum()) if "lstv_class" in df.columns else 0
+
+    lines = [
+        "# Browse by anomaly class",
+        "",
+        f"Total scans: **{total}** — of which **{n_anom}** carry an LSTV/TLTV "
+        "anomaly (`lstv_class != normal`).",
+        "",
+        "Click any series_id to navigate to its scan directory; CT and mask "
+        "files are at `scans/{series_id}/ct.nii.gz` and `mask.nii.gz`.  See "
+        "`radiologist_review.csv` for the auditor's plain-English evidence "
+        "strings per scan.",
+        "",
+        "---",
+        "",
+    ]
+
+    for cls in class_order:
+        sub = df[df["lstv_class"] == cls] if "lstv_class" in df.columns else df.head(0)
+        n = len(sub)
+        if n == 0:
+            continue
+        # For the full corpus, the normal section would be 300+ entries — skip it
+        if cls == "normal" and n > 50:
+            lines.append(f"## normal  ({n} scans)")
+            lines.append("")
+            lines.append(f"_{n} normal-anatomy scans omitted from this index.  "
+                         f"See `radiologist_review.csv` for the complete list._")
+            lines.append("")
+            continue
+        lines.append(f"## {cls}  —  {class_titles.get(cls, cls)}  ({n} scans)")
+        lines.append("")
+        for _, row in sub.sort_values("series_id").iterrows():
+            sid     = row["series_id"]
+            n_lbl   = int(row["n_labels"]) if pd.notna(row.get("n_labels")) else 0
+            tags    = []
+            if bool(row.get("veridah_applied", False)):
+                kind = row.get("veridah_kind") or "veridah-corrected"
+                tags.append(f"_{kind}_")
+            tag_str = "  " + " • ".join(tags) if tags else ""
+            lines.append(f"- [`{sid}`](scans/{sid}/)  —  {n_lbl} labels{tag_str}")
+        lines.append("")
+
+    out = staging_dir / "BROWSE_BY_CLASS.md"
+    out.write_text("\n".join(lines))
+    log.info("Wrote browse-by-class index: %s (%d sections)", out,
+             sum(1 for cls in class_order if len(df[df.get("lstv_class") == cls]) > 0))
+    return out
+
+
 def write_orientation_audit_proof(staging_dir: Path, gate_result: dict[str, Any]) -> Path:
     p = staging_dir / "orientation_audit.json"
     p.write_text(json.dumps(gate_result, indent=2))
@@ -937,6 +1113,7 @@ def stage_dataset(
     subset_series_ids: list[str] | None = None,
     run_gate:       bool = False,
     orient_audit_path: Path | None = None,
+    lstv_audit_path:   Path | None = None,
     manifest_csv:   Path | None = None,
 ) -> dict[str, Any]:
     """Stage subjects + write top-level files.
@@ -1088,6 +1265,13 @@ def stage_dataset(
     copy_veridah_manifest(corrected_dir, staging_dir, subset_set)
     copy_manifest(manifest_csv, staging_dir, subset_set)
 
+    # Radiologist-facing review CSV + browse-by-class markdown index.
+    # Both are cheap (~1ms each), useful for clinician review of any subset.
+    write_radiologist_review_csv(
+        staging_dir, manifest_csv, lstv_audit_path, subset_set,
+    )
+    write_browse_by_class_md(staging_dir, manifest_csv, subset_set)
+
     # 5. README stats — compute per-subset
     split_counts: dict[str, int] = {}
     for sid in series_ids:
@@ -1173,6 +1357,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--orient_audit_path", type=Path, default=None,
                    help="Path to stage 9's orientation audit manifest.  "
                         "Default: <canonical_dir>/../orientation/orient_audit_manifest.json")
+    p.add_argument("--lstv_audit_path", type=Path, default=None,
+                   help="Path to stage 8's LSTV audit manifest.  Joined into "
+                        "radiologist_review.csv for the per-scan evidence "
+                        "strings.  Default: <canonical_dir>/../lstv/lstv_audit_manifest.json")
     p.add_argument("--no_upload",     action="store_true",
                    help="Stage only; don't push to HF.  Useful for inspection.")
 
@@ -1225,6 +1413,11 @@ def main(argv: list[str] | None = None) -> int:
         args.orient_audit_path = (
             args.canonical_dir.parent / "orientation" / "orient_audit_manifest.json"
         )
+    # Default LSTV audit path: data/lstv/lstv_audit_manifest.json
+    if args.lstv_audit_path is None:
+        args.lstv_audit_path = (
+            args.canonical_dir.parent / "lstv" / "lstv_audit_manifest.json"
+        )
 
     # =========================================================================
     # PHASE 1 — full dataset
@@ -1245,6 +1438,7 @@ def main(argv: list[str] | None = None) -> int:
             stage_mode=effective_stage_mode,
             run_gate=args.gate,
             orient_audit_path=args.orient_audit_path,
+            lstv_audit_path=args.lstv_audit_path,
             manifest_csv=args.manifest_csv,
         )
     except RuntimeError as e:
@@ -1331,6 +1525,7 @@ def main(argv: list[str] | None = None) -> int:
             subset_series_ids=sample_ids,
             run_gate=False,                          # never re-gate for the sample
             orient_audit_path=args.orient_audit_path,
+            lstv_audit_path=args.lstv_audit_path,
             manifest_csv=args.manifest_csv,
         )
     except RuntimeError as e:
@@ -1410,6 +1605,7 @@ def main(argv: list[str] | None = None) -> int:
             subset_series_ids=lstv_ids,
             run_gate=False,
             orient_audit_path=args.orient_audit_path,
+            lstv_audit_path=args.lstv_audit_path,
             manifest_csv=args.manifest_csv,
         )
     except RuntimeError as e:

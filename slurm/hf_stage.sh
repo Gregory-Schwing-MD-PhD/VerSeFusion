@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
+#SBATCH --mem=64G
 #SBATCH --time=01:30:00
 #SBATCH --output=logs/verse-hf-stage-%j.out
 #SBATCH --error=logs/verse-hf-stage-%j.err
@@ -39,10 +39,12 @@ cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 
 HF_REPO_ID="${HF_REPO_ID:-gregoryschwingmdphd/VerseFusion}"
 HF_SAMPLE_REPO_ID="${HF_SAMPLE_REPO_ID:-gregoryschwingmdphd/VerseFusion-Sample}"
+HF_LSTV_REPO_ID="${HF_LSTV_REPO_ID:-gregoryschwingmdphd/VerseFusion-LSTV}"
 HF_SAMPLE_N="${HF_SAMPLE_N:-10}"
 HF_DATASET_PRETTY_NAME="${HF_DATASET_PRETTY_NAME:-VerSeFusion}"
 HF_STAGING_DIR="${HF_STAGING_DIR:-${DATA_DIR}/hf_staging}"
 HF_SAMPLE_STAGING_DIR="${HF_SAMPLE_STAGING_DIR:-${DATA_DIR}/hf_staging_sample}"
+HF_LSTV_STAGING_DIR="${HF_LSTV_STAGING_DIR:-${DATA_DIR}/hf_staging_lstv}"
 HF_MANIFEST_CSV="${HF_MANIFEST_CSV:-${DATA_DIR}/manifest/manifest.csv}"
 
 EXPORT_FLAGS=(
@@ -50,6 +52,8 @@ EXPORT_FLAGS=(
     --sample_n             "${HF_SAMPLE_N}"
     --sample_repo_id       "${HF_SAMPLE_REPO_ID}"
     --sample_staging_dir   "${HF_SAMPLE_STAGING_DIR}"
+    --lstv_repo_id         "${HF_LSTV_REPO_ID}"
+    --lstv_staging_dir     "${HF_LSTV_STAGING_DIR}"
 )
 # Manifest from stage 10 (gives us LSTV + cv_fold columns in the staged dataset)
 if [[ -f "${HF_MANIFEST_CSV}" ]]; then
@@ -66,7 +70,7 @@ fi
 [[ "${HF_SYMLINK:-0}" = "1" ]] && EXPORT_FLAGS+=( --symlink )
 [[ -n "${HF_PREVIEW_DIR:-}" ]] && EXPORT_FLAGS+=( --preview_dir "${HF_PREVIEW_DIR}" )
 
-mkdir -p "${HF_STAGING_DIR}" "${HF_SAMPLE_STAGING_DIR}"
+mkdir -p "${HF_STAGING_DIR}" "${HF_SAMPLE_STAGING_DIR}" "${HF_LSTV_STAGING_DIR}"
 
 echo "============================================================"
 echo "HF stage job (NO UPLOAD)"
@@ -76,6 +80,8 @@ echo "  sample_n:         ${HF_SAMPLE_N}"
 echo "  pretty_name:      ${HF_DATASET_PRETTY_NAME}"
 echo "  full staging:     ${HF_STAGING_DIR}"
 echo "  sample staging:   ${HF_SAMPLE_STAGING_DIR}"
+echo "  lstv repo:        ${HF_LSTV_REPO_ID}"
+echo "  lstv staging:     ${HF_LSTV_STAGING_DIR}"
 echo "============================================================"
 
 singularity exec \
